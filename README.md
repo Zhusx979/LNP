@@ -29,9 +29,6 @@ src/
   dataset.py            pretraining dataset pipeline
   model_regression.py   regression model and data module
 
-configs/
-  config_pretrain.json  pretraining configuration
-
 data/                   example pretraining data
 AGILE/                  downstream evaluation data
 train_pretrain.py       stage 1 entry point
@@ -43,7 +40,7 @@ validate.py             environment and pipeline check
 
 ### Pretraining
 
-The pretraining CSV specified in `configs/config_pretrain.json` must contain:
+The pretraining CSV passed through `train_pretrain.py --csv-paths ...` must contain:
 
 ```text
 SMILES
@@ -91,6 +88,20 @@ Run stage 1 pretraining:
 python train_pretrain.py
 ```
 
+Override the default pretraining dataset or hyperparameters:
+
+```bash
+python train_pretrain.py --csv-paths data/test_lipids.csv --num-epochs 5 --batch-size 4
+```
+
+Select a specific GPU or multiple GPUs for pretraining:
+
+```bash
+python train_pretrain.py --gpus 0
+python train_pretrain.py --gpus 0,1
+python train_pretrain.py --gpus all
+```
+
 Run stage 2 regression:
 
 ```bash
@@ -101,6 +112,14 @@ Use a custom regression dataset:
 
 ```bash
 python train_regression.py --csv path/to/your_labels.csv
+```
+
+Select a specific GPU or multiple GPUs for regression:
+
+```bash
+python train_regression.py --gpus 0
+python train_regression.py --gpus 0,1
+python train_regression.py --gpus all
 ```
 
 ## Outputs
@@ -131,7 +150,7 @@ logs/
 
 ## Files Most Relevant for Reproduction
 
-- `configs/config_pretrain.json` for hyperparameters and data paths
+- `train_pretrain.py` for pretraining hyperparameters and data paths
 - `src/tokenizer.py` for SMILES tokenization logic
 - `src/dataset.py` for pretraining sample construction
 - `src/model_regression.py` for regression head design and label normalization

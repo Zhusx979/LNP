@@ -160,7 +160,7 @@ def main():
     if all_passed:
         print("ALL TESTS PASSED - Ready to train!")
         print("\n  Next steps:")
-        print("  1. Review config: configs/config_pretrain.json")
+        print("  1. Review CLI args: python train_pretrain.py --help")
         print("  2. Start training: python train_pretrain.py")
         print("  3. Monitor logs: tail -f logs/training.log")
         print("="*70)
