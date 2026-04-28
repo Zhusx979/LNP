@@ -41,12 +41,11 @@ def test_csv_availability():
     """Check if CSV files are available."""
     print_header("TEST 3: CSV FILE AVAILABILITY")
     root = Path(__file__).parent
-    csv_files = list(root.glob("*.csv"))
+    data_dir = root / "data"
+    csv_files = list(data_dir.glob("*.csv"))
     
     if not csv_files:
         print("WARNING: No CSV files found in root directory")
-        print(f"  Expected: LNP_virtual_lipid_library_generated1.csv")
-        print(f"  Expected: LNP_virtual_lipid_library_generated2.csv")
         return False
     
     print(f"Found {len(csv_files)} CSV files:")
