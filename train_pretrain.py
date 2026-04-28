@@ -12,7 +12,6 @@ This script implements a complete training pipeline with:
 import json
 import logging
 import os
-from modelscope import snapshot_download
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -27,8 +26,15 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 import pandas as pd
 
+try:
+    from modelscope import snapshot_download
+except ImportError:
+    snapshot_download = None
+
 # Import custom modules
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+PROJECT_ROOT = Path(__file__).parent
+PROJECT_ROOT.joinpath("logs").mkdir(parents=True, exist_ok=True)
+sys.path.insert(0, str(PROJECT_ROOT))
 from src.tokenizer import SMILESTokenizer
 from src.dataset import SMILESDataModule
 
@@ -83,8 +89,8 @@ class QwenSMILESPretrainer:
         self.scaler = None
         self.data_module = None
         self.amp_dtype = None
-        self.use_amp = Path(self.config['optimization']['use_amp'])
-        self.use_grad_scaler = Path(self.config['optimization']['outuse_grad_scalerput_dir'])
+        self.use_amp = bool(self.config['optimization'].get('use_amp', False))
+        self.use_grad_scaler = bool(self.config['optimization'].get('use_grad_scaler', False))
         
         # Training state
         self.current_epoch = 0
@@ -155,21 +161,30 @@ class QwenSMILESPretrainer:
         self.use_grad_scaler = self.amp_dtype == torch.float16
         
         try:
-            model_dir = snapshot_download(
-                model_name,
-                revision="v1.0.0", 
-                cache_dir=self.config['paths']['model_cache_dir']
-            )
+            if self.resume_from:
+                model_dir = str(Path(self.resume_from))
+                logger.info(f"  Resuming model weights from: {model_dir}")
+            else:
+                if snapshot_download is None:
+                    raise ImportError(
+                        "modelscope is required to download the base model. "
+                        "Install it with: pip install modelscope"
+                    )
+                model_dir = snapshot_download(
+                    model_name,
+                    revision="v1.0.0",
+                    cache_dir=self.config['paths']['model_cache_dir']
+                )
 
             if self.use_grad_scaler:
-                dtype = torch.float32 
+                dtype = torch.float32
             else:
                 dtype = self.amp_dtype or torch.float32
 
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_dir,
                 torch_dtype=dtype,
-                device_map=None, 
+                device_map=None,
                 trust_remote_code=True
             )
 
@@ -200,9 +215,12 @@ class QwenSMILESPretrainer:
         # Setup optimizer
         logger.info("[4/4] Setting up optimizer and scheduler...")
         self._setup_optimizer()
-        
+
         # Initialize mixed precision scaler
         self.scaler = GradScaler(enabled=self.use_grad_scaler)
+
+        if self.resume_from:
+            self._restore_training_state(self.resume_from)
         
         logger.info("="*60)
         logger.info("Setup complete\n")
@@ -238,7 +256,8 @@ class QwenSMILESPretrainer:
         # Calculate total training steps
         num_epochs = self.config['training']['num_epochs']
         gradient_accumulation_steps = self.config['training']['gradient_accumulation_steps']
-        num_training_steps = len(self.train_loader) * num_epochs // gradient_accumulation_steps
+        steps_per_epoch = max(1, (len(self.train_loader) + gradient_accumulation_steps - 1) // gradient_accumulation_steps)
+        num_training_steps = max(1, steps_per_epoch * num_epochs)
         
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
@@ -249,6 +268,27 @@ class QwenSMILESPretrainer:
         logger.info(f"  Total training steps: {num_training_steps}")
         logger.info(f"  Learning rate: {self.config['training']['learning_rate']}")
         logger.info(f"  Warmup steps: {self.config['training']['warmup_steps']}")
+
+    def _restore_training_state(self, checkpoint_dir: str):
+        """Restore optimizer/scheduler/scaler state from a checkpoint directory."""
+        state_path = Path(checkpoint_dir) / 'training_state.pt'
+        if not state_path.exists():
+            logger.warning(f"Training state not found for resume: {state_path}")
+            return
+
+        state = torch.load(state_path, map_location='cpu')
+        self.current_step = state.get('step', 0)
+        self.current_epoch = state.get('epoch', 0)
+        self.best_val_loss = state.get('best_val_loss', float('inf'))
+        self.optimizer.load_state_dict(state['optimizer_state'])
+        self.scheduler.load_state_dict(state['scheduler_state'])
+        scaler_state = state.get('scaler_state')
+        if scaler_state and self.scaler is not None:
+            self.scaler.load_state_dict(scaler_state)
+        logger.info(
+            f"  Restored training state from {state_path} "
+            f"(epoch={self.current_epoch}, step={self.current_step})"
+        )
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
@@ -266,7 +306,9 @@ class QwenSMILESPretrainer:
         logging_steps = self.config['training']['logging_steps']
         
         logger.info(f"\nEpoch {epoch + 1}/{self.config['training']['num_epochs']}")
-        
+
+        self.optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, batch in enumerate(tqdm(self.train_loader)):
             if not isinstance(batch, dict):
                 raise TypeError(
@@ -281,10 +323,10 @@ class QwenSMILESPretrainer:
                     attention_mask=batch['attention_mask'],
                     labels=batch['target_ids'],
                 )
-                loss = outputs.loss
-            
+                raw_loss = outputs.loss
+
             # Scale loss for gradient accumulation
-            loss = loss / gradient_accumulation_steps
+            loss = raw_loss / gradient_accumulation_steps
             
             # Backward pass
             if self.use_grad_scaler:
@@ -293,10 +335,14 @@ class QwenSMILESPretrainer:
                 loss.backward()
             
             # Accumulate metrics
-            total_loss += loss.item()
+            total_loss += raw_loss.item()
             
             # Update weights every accumulation step
-            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            should_step = (
+                (batch_idx + 1) % gradient_accumulation_steps == 0
+                or (batch_idx + 1) == len(self.train_loader)
+            )
+            if should_step:
                 # Clip gradients
                 if self.use_grad_scaler:
                     self.scaler.unscale_(self.optimizer)
@@ -315,29 +361,27 @@ class QwenSMILESPretrainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 
                 self.current_step += 1
-            
-            # Logging
-            if (batch_idx + 1) % logging_steps == 0:
-                avg_loss = total_loss / ((batch_idx + 1) / gradient_accumulation_steps)
-                perplexity = np.exp(avg_loss)
-                logger.info(
-                    f"  Step {self.current_step} | Loss: {avg_loss:.4f} | "
-                    f"  Perplexity: {perplexity:.4f} | LR: {self.optimizer.param_groups[0]['lr']:.2e}"
-                )
-            
-            # Validation
-            if self.current_step > 0 and self.current_step % self.config['training']['eval_steps'] == 0:
-                val_loss = self.validate()
-                self.model.train()  # Resume training mode
-                
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self.save_checkpoint(is_best=True)
-                    logger.info(f"New best validation loss: {val_loss:.4f}")
-            
-            # Checkpoint
-            if self.current_step > 0 and self.current_step % self.config['training']['save_steps'] == 0:
-                self.save_checkpoint()
+
+                # Logging / validation / checkpoint are step-based so they only fire once.
+                if self.current_step % logging_steps == 0:
+                    avg_loss = total_loss / (batch_idx + 1)
+                    perplexity = np.exp(avg_loss)
+                    logger.info(
+                        f"  Step {self.current_step} | Loss: {avg_loss:.4f} | "
+                        f"  Perplexity: {perplexity:.4f} | LR: {self.optimizer.param_groups[0]['lr']:.2e}"
+                    )
+
+                if self.current_step % self.config['training']['eval_steps'] == 0:
+                    val_loss = self.validate()
+                    self.model.train()  # Resume training mode
+
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.save_checkpoint(is_best=True)
+                        logger.info(f"New best validation loss: {val_loss:.4f}")
+
+                if self.current_step % self.config['training']['save_steps'] == 0:
+                    self.save_checkpoint()
         
         # Epoch metrics
         epoch_loss = total_loss / len(self.train_loader)
@@ -389,6 +433,8 @@ class QwenSMILESPretrainer:
         
         # Save model
         self.model.save_pretrained(str(save_dir))
+        if self.tokenizer is not None:
+            self.tokenizer.save(str(save_dir / "tokenizer.json"))
         
         # Save training state
         state = {
@@ -397,7 +443,7 @@ class QwenSMILESPretrainer:
             'best_val_loss': self.best_val_loss,
             'optimizer_state': self.optimizer.state_dict(),
             'scheduler_state': self.scheduler.state_dict(),
-            'scaler_state': self.scaler.state_dict(),
+            'scaler_state': self.scaler.state_dict() if self.scaler is not None else None,
         }
         torch.save(state, str(save_dir / 'training_state.pt'))
         
@@ -422,7 +468,8 @@ class QwenSMILESPretrainer:
         metrics_history = []
         
         try:
-            for epoch in range(self.config['training']['num_epochs']):
+            start_epoch = self.current_epoch
+            for epoch in range(start_epoch, self.config['training']['num_epochs']):
                 self.current_epoch = epoch
                 
                 # Train epoch
@@ -456,6 +503,8 @@ class QwenSMILESPretrainer:
                 import shutil
                 shutil.rmtree(final_dir)
             self.model.save_pretrained(str(final_dir))
+            if self.tokenizer is not None:
+                self.tokenizer.save(str(final_dir / "tokenizer.json"))
             logger.info(f"Final model saved: {final_dir}")
             
             # Save metrics

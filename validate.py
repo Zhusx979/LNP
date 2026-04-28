@@ -10,8 +10,8 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from tokenizer import SMILESTokenizer, test_tokenizer, test_vocab_building, test_encode_decode
-from dataset import test_dataset_pipeline
+from src.tokenizer import SMILESTokenizer, test_tokenizer, test_vocab_building, test_encode_decode
+from src.dataset import test_dataset_pipeline
 
 
 def print_header(title: str):
@@ -27,14 +27,14 @@ def test_tokenizer_module():
     test_tokenizer()
     test_vocab_building()
     test_encode_decode()
-    print("? Tokenizer tests passed")
+    print("Tokenizer tests passed")
 
 
 def test_dataset_module():
     """Test dataset pipeline."""
     print_header("TEST 2: DATASET PIPELINE")
     test_dataset_pipeline()
-    print("? Dataset tests passed")
+    print("Dataset tests passed")
 
 
 def test_csv_availability():
@@ -44,12 +44,12 @@ def test_csv_availability():
     csv_files = list(root.glob("*.csv"))
     
     if not csv_files:
-        print("? WARNING: No CSV files found in root directory")
+        print("WARNING: No CSV files found in root directory")
         print(f"  Expected: LNP_virtual_lipid_library_generated1.csv")
         print(f"  Expected: LNP_virtual_lipid_library_generated2.csv")
         return False
     
-    print(f"? Found {len(csv_files)} CSV files:")
+    print(f"Found {len(csv_files)} CSV files:")
     for csv_file in csv_files:
         size_mb = csv_file.stat().st_size / (1024*1024)
         print(f"  - {csv_file.name} ({size_mb:.1f} MB)")
@@ -72,14 +72,14 @@ def test_dependencies():
     for module_name, display_name in dependencies.items():
         try:
             __import__(module_name)
-            print(f"? {display_name} installed")
+            print(f"{display_name} installed")
         except ImportError:
-            print(f"? {display_name} NOT installed")
+            print(f"{display_name} NOT installed")
             missing.append(module_name)
     
     if missing:
-        print(f"\n? Missing dependencies. Install with:")
-        print(f"  pip install {' '.join(missing)}")
+        print(f"\nMissing dependencies. Install with:")
+        print(f"pip install {' '.join(missing)}")
         return False
     
     return True
@@ -92,21 +92,21 @@ def test_gpu():
     try:
         import torch
         if torch.cuda.is_available():
-            print(f"? GPU available: {torch.cuda.get_device_name(0)}")
-            print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            print(f"GPU available: {torch.cuda.get_device_name(0)}")
+            print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
             return True
         else:
-            print("? GPU not available - training will use CPU (slower)")
+            print("GPU not available - training will use CPU (slower)")
             return False
     except Exception as e:
-        print(f"? GPU check failed: {e}")
+        print(f"GPU check failed: {e}")
         return False
 
 
 def main():
     """Run all tests."""
     print("\n" + "="*70)
-    print("  SMILES-BASED QWEN PIPELINE - VALIDATION SUITE")
+    print("SMILES-BASED QWEN PIPELINE - VALIDATION SUITE")
     print("="*70)
     
     results = {}
@@ -116,7 +116,7 @@ def main():
     
     if not results['dependencies']:
         print("\n" + "="*70)
-        print("? VALIDATION FAILED - Missing dependencies")
+        print("VALIDATION FAILED - Missing dependencies")
         print("="*70)
         return False
     
@@ -131,7 +131,7 @@ def main():
         test_tokenizer_module()
         results['tokenizer'] = True
     except Exception as e:
-        print(f"? Tokenizer test failed: {e}")
+        print(f"Tokenizer test failed: {e}")
         results['tokenizer'] = False
     
     # Test 5: Dataset
@@ -139,7 +139,7 @@ def main():
         test_dataset_module()
         results['dataset'] = True
     except Exception as e:
-        print(f"? Dataset test failed: {e}")
+        print(f"Dataset test failed: {e}")
         results['dataset'] = False
     
     # Summary
@@ -153,13 +153,13 @@ def main():
     ])
     
     for test_name, passed in results.items():
-        status = "? PASS" if passed else "? FAIL"
+        status = "PASS" if passed else "? FAIL"
         print(f"  {status}: {test_name.capitalize()}")
     
     print("\n" + "="*70)
     
     if all_passed:
-        print("  ? ALL TESTS PASSED - Ready to train!")
+        print("ALL TESTS PASSED - Ready to train!")
         print("\n  Next steps:")
         print("  1. Review config: configs/config_pretrain.json")
         print("  2. Start training: python train_pretrain.py")
@@ -167,7 +167,7 @@ def main():
         print("="*70)
         return True
     else:
-        print("  ? SOME TESTS FAILED - Please fix above issues")
+        print("SOME TESTS FAILED - Please fix above issues")
         print("="*70)
         return False
 

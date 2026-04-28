@@ -205,6 +205,7 @@ class SMILESDataModule:
                 f"After deduplication: {len(unique_smiles)} unique SMILES "
                 f"(removed {len(all_smiles) - len(unique_smiles)})"
             )
+            return unique_smiles
         return all_smiles
     
 

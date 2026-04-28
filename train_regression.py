@@ -110,8 +110,24 @@ class QwenRegressionTrainer:
         logger.info("[1/3] Loading SMILES tokenizer...")
         self.tokenizer = SMILESTokenizer()
         self.tokenizer.load(self.tokenizer_path)
-        logger.info(f"  Vocabulary size: {len(self.tokenizer)}")
-        
+        logger.info(f"  Initial vocabulary size: {len(self.tokenizer)}")
+
+        data_module = RegressionDataModule(
+            csv_path=self.regression_csv,
+            tokenizer=self.tokenizer,
+            batch_size=self.batch_size,
+            auto_discover_agile=self.auto_discover_agile,
+        )
+
+        smiles_list, _ = data_module.load_data()
+        original_vocab_size = len(self.tokenizer)
+        self.tokenizer.build_vocab(smiles_list)
+        expanded_vocab_size = len(self.tokenizer)
+        logger.info(
+            f"  Regression vocabulary size: {expanded_vocab_size} "
+            f"(added {expanded_vocab_size - original_vocab_size} tokens)"
+        )
+
         # Load pretrained model
         logger.info("[2/3] Loading pretrained Qwen model...")
         mixed_precision = self.config.mixed_precision
@@ -124,35 +140,28 @@ class QwenRegressionTrainer:
         self.use_amp = self.amp_dtype is not None
         self.use_grad_scaler = self.amp_dtype == torch.float16
 
-        if self.use_grad_scaler:
-            dtype = torch.float32 
-        else:
-            dtype = self.amp_dtype or torch.float32
+        dtype = self.amp_dtype or torch.float32
 
         base_model = AutoModelForCausalLM.from_pretrained(
             self.pretrained_model_path,
             torch_dtype=dtype,
-            device_map='auto',
+            device_map=None,
             trust_remote_code=True,
         )
+        base_model.resize_token_embeddings(len(self.tokenizer))
 
-    
         # Create regression model
         self.model = QwenRegressionModel(base_model)
         self.model = self.model.to(self.device, dtype=dtype)
+        self._configure_trainable_parameters()
         logger.info(f"  Mixed precision mode: {mixed_precision}")
         logger.info(f"  AMP enabled: {self.use_amp}")
         logger.info(f"  GradScaler enabled: {self.use_grad_scaler}")
         logger.info(f"  Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        
+        logger.info(f"  Trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
+
         # Load data
         logger.info("[3/3] Loading regression dataset...")
-        data_module = RegressionDataModule(
-            csv_path=self.regression_csv,
-            tokenizer=self.tokenizer,
-            batch_size=self.batch_size,
-            auto_discover_agile=self.auto_discover_agile,
-        )
         data_module.setup()
         self.train_loader, self.val_loader, self.test_loader = data_module.create_loaders()
         
@@ -162,6 +171,29 @@ class QwenRegressionTrainer:
         
         logger.info("="*60)
         logger.info("Setup complete\n")
+
+    def _configure_trainable_parameters(self):
+        """Freeze the backbone by default to keep single-GPU fine-tuning tractable."""
+        if self.config.full_finetune:
+            for parameter in self.model.parameters():
+                parameter.requires_grad = True
+            logger.info("  Full fine-tuning enabled")
+            return
+
+        for parameter in self.model.model.parameters():
+            parameter.requires_grad = False
+
+        if self.config.train_embeddings:
+            input_embeddings = self.model.model.get_input_embeddings()
+            for parameter in input_embeddings.parameters():
+                parameter.requires_grad = True
+
+        for parameter in self.model.head.parameters():
+            parameter.requires_grad = True
+
+        logger.info(
+            f"  Backbone frozen: True | Train embeddings: {self.config.train_embeddings}"
+        )
     
     def train(self, num_epochs: int = 10, learning_rate: float = 1e-5):
         """Train regression model."""
@@ -171,13 +203,13 @@ class QwenRegressionTrainer:
         
         # Setup optimizer
         optimizer = AdamW(
-            self.model.parameters(),
+            [p for p in self.model.parameters() if p.requires_grad],
             lr=learning_rate,
-            weight_decay=0.01,
+            weight_decay=0.001,
         )
-        
+
         criterion = nn.MSELoss()
-        scaler = GradScaler()
+        scaler = GradScaler(enabled=self.use_grad_scaler)
         
         metrics_history = []
         
@@ -228,38 +260,51 @@ class QwenRegressionTrainer:
     def _train_epoch(self, epoch: int, optimizer, criterion, scaler):
         """Train one epoch."""
         self.model.train()
+
         total_loss = 0.0
-        
-        for batch_idx, batch in tqdm(enumerate(self.train_loader)):
+        gradient_accumulation_steps = int(self.config.gradient_accumulation_steps)
+        optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, batch in tqdm(
+            enumerate(self.train_loader),
+            total=len(self.train_loader),
+            desc=f"Epoch {epoch + 1}",
+        ):
             batch = {k: v.to(self.device) for k, v in batch.items()}
-            labels = batch.pop('label')
+            labels = batch.pop('label').view(-1)
             
             # Forward pass
             with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                predictions = self.model(**batch)
-                loss = criterion(predictions.squeeze(), labels)
-            
+                predictions = self.model(**batch).view(-1)
+                raw_loss = criterion(predictions, labels)
+            loss = raw_loss / gradient_accumulation_steps
+            # Accumulate metrics
+            total_loss += raw_loss.item()
+
             # Backward pass
             if self.use_grad_scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
-            # Accumulate metrics
-            total_loss += loss.item()
-            
-            
-            # Clip gradients
-            if self.use_grad_scaler:
-                scaler.unscale_(optimizer)
-            
-            # Optimizer step
-            if self.use_grad_scaler:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+
+            should_step = (
+                (batch_idx + 1) % gradient_accumulation_steps == 0
+                or (batch_idx + 1) == len(self.train_loader)
+            )
+            if should_step:
+                if self.use_grad_scaler:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad],
+                    float(self.config.max_grad_norm),
+                )
+                # Optimizer step
+                if self.use_grad_scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
         
         return total_loss / len(self.train_loader)
     
@@ -273,19 +318,23 @@ class QwenRegressionTrainer:
         
         for batch in self.val_loader:
             batch = {k: v.to(self.device) for k, v in batch.items()}
-            labels = batch.pop('label')
+            labels = batch.pop('label').view(-1)
             
             with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                predictions = self.model(**batch)
-                loss = criterion(predictions.squeeze(), labels)
+                predictions = self.model(**batch).view(-1)
+                loss = criterion(predictions, labels)
             
             total_loss += loss.item()
-            all_preds.extend(predictions.squeeze().cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predictions.detach().cpu().tolist())
+            all_labels.extend(labels.detach().cpu().tolist())
         
         # Compute metrics
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
+        label_scaler = getattr(self.val_loader.dataset, "label_scaler", None)
+        if label_scaler is not None:
+            all_preds = label_scaler.inverse_transform(all_preds.reshape(-1, 1)).flatten()
+            all_labels = label_scaler.inverse_transform(all_labels.reshape(-1, 1)).flatten()
         
         rmse = np.sqrt(np.mean((all_preds - all_labels) ** 2))
         mae = np.mean(np.abs(all_preds - all_labels))
@@ -296,8 +345,17 @@ class QwenRegressionTrainer:
         """Save model checkpoint."""
         save_dir = self.output_dir / ("best_model" if is_best else "final_model")
         save_dir.mkdir(parents=True, exist_ok=True)
-        
-        torch.save(self.model.state_dict(), save_dir / "model.pt")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        cpu_state_dict = {
+            key: value.detach().cpu()
+            for key, value in self.model.state_dict().items()
+        }
+        torch.save(cpu_state_dict, save_dir / "model.pt")
+        if self.tokenizer is not None:
+            self.tokenizer.save(save_dir / "tokenizer.json")
         logger.info(f"Model saved: {save_dir}")
 
 
@@ -335,6 +393,12 @@ Examples:
                        help='Number of batches')
     parser.add_argument('--lr', type=float, default=1e-5,
                        help='Learning rate')
+    parser.add_argument('--gradient_accumulation_steps', default=4,
+                       type=int,
+                       help='gradient_accumulation_steps')
+    parser.add_argument('--max_grad_norm', default=1.0,
+                       type=float,
+                       help='max_grad_norm')
     
     parser.add_argument('--use_amp', default=False,
                        help='use_amp')
@@ -343,6 +407,12 @@ Examples:
     
     parser.add_argument('--mixed_precision', default="none",
                        help='mixed_precision')
+    parser.add_argument('--full_finetune', action='store_true',
+                       help='Train the entire backbone instead of freezing it')
+    parser.add_argument('--train_embeddings', action='store_true', default=True,
+                       help='Keep resized input embeddings trainable when backbone is frozen')
+    parser.add_argument('--no-train-embeddings', dest='train_embeddings', action='store_false',
+                       help='Freeze resized input embeddings together with the backbone')
     
     
     args = parser.parse_args()

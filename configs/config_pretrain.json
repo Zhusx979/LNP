@@ -10,7 +10,7 @@
       "data/test_lipids.csv"
     ],
     "validation_split": 0.15,
-    "batch_size": 16,
+    "batch_size": 1,
     "num_workers": 0,
     "deduplicate": false
   },

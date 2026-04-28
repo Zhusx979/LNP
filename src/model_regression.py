@@ -101,6 +101,8 @@ class RegressionDataset(Dataset):
         tokenizer,
         max_length: int = 256,
         normalize: bool = True,
+        label_scaler: Optional[StandardScaler] = None,
+        fit_label_scaler: bool = False,
     ):
         """
         Initialize regression dataset.
@@ -119,10 +121,15 @@ class RegressionDataset(Dataset):
         
         # Normalize labels
         self.normalize = normalize
-        self.label_scaler = None
+        self.label_scaler = label_scaler
         if normalize:
-            self.label_scaler = StandardScaler()
-            self.labels = self.label_scaler.fit_transform(labels.reshape(-1, 1)).flatten()
+            if self.label_scaler is None:
+                self.label_scaler = StandardScaler()
+                fit_label_scaler = True
+            if fit_label_scaler:
+                self.labels = self.label_scaler.fit_transform(labels.reshape(-1, 1)).flatten()
+            else:
+                self.labels = self.label_scaler.transform(labels.reshape(-1, 1)).flatten()
     
     def __len__(self) -> int:
         return len(self.smiles_list)
@@ -190,6 +197,7 @@ class RegressionDataModule:
         self.val_loader = None
         self.test_loader = None
         self.loaded_csv_files = []
+        self.label_scaler = None
     
     @staticmethod
     def discover_agile_csvs(root_dir: str = "AGILE") -> List[str]:
@@ -337,29 +345,36 @@ class RegressionDataModule:
         val_idx = indices[n_train:n_train+n_val]
         test_idx = indices[n_train+n_val:]
         
+        train_labels = labels[train_idx]
+        self.label_scaler = StandardScaler() if self.normalize_labels else None
+
         # Create datasets
         self.train_dataset = RegressionDataset(
             [smiles_list[i] for i in train_idx],
-            labels[train_idx],
+            train_labels,
             self.tokenizer,
             self.max_length,
             normalize=self.normalize_labels,
+            label_scaler=self.label_scaler,
+            fit_label_scaler=self.normalize_labels,
         )
-        
+
         self.val_dataset = RegressionDataset(
             [smiles_list[i] for i in val_idx],
             labels[val_idx],
             self.tokenizer,
             self.max_length,
             normalize=self.normalize_labels,
+            label_scaler=self.label_scaler,
         )
-        
+
         self.test_dataset = RegressionDataset(
             [smiles_list[i] for i in test_idx],
             labels[test_idx],
             self.tokenizer,
             self.max_length,
             normalize=self.normalize_labels,
+            label_scaler=self.label_scaler,
         )
         
         logger.info(f"Train/Val/Test split: {n_train}/{n_val}/{n_test}")
@@ -373,21 +388,21 @@ class RegressionDataModule:
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
         
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
         
         self.test_loader = DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
         
         return self.train_loader, self.val_loader, self.test_loader

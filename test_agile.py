@@ -124,8 +124,8 @@ if __name__ == "__main__":
     if success1 and success2:
         print("\nALL TESTS PASSED\n")
         print("You can now run Stage 2 training with:")
-        print("  python train_regression.py\n")
+        print("python train_regression.py\n")
         sys.exit(0)
     else:
-        print("\n? SOME TESTS FAILED\n")
+        print("\nSOME TESTS FAILED\n")
         sys.exit(1)
