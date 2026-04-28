@@ -1,0 +1,10 @@
+models/
+cache/
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+__pycache__/
+*.pyc
+logs/
+outputs/
