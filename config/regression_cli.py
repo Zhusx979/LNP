@@ -3,7 +3,7 @@
 import argparse
 from typing import Dict
 
-from ..src.training_common import str2bool
+from src.training_common import str2bool
 
 
 DEFAULT_REGRESSION_CSV = None

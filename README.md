@@ -1,60 +1,112 @@
 # Virtual LNP
 
-SMILES-based pretraining and regression pipeline for lipid nanoparticle (LNP) modeling.
+SMILES-driven lipid nanoparticle (LNP) modeling pipeline: molecular language pretraining followed by downstream regression.
 
 ## Overview
 
-The project is organized as a two-stage pipeline:
+This repository provides a two-stage workflow for learning LNP-related representations from SMILES and transferring them to property prediction tasks:
 
 1. `train_pretrain.py`
-   Self-supervised causal language modeling on SMILES sequences.
+   Self-supervised causal language modeling on SMILES sequences
 2. `train_regression.py`
-   Regression fine-tuning on labeled downstream datasets.
+   Regression fine-tuning on labeled data (`transfection_efficiency` / `TARGET`)
 
-Instead of using a generic text tokenizer, the codebase includes a rule-based SMILES tokenizer designed to preserve chemically meaningful tokens, ring indices, brackets, and bond operators.
+Instead of a generic text tokenizer, the project includes a rule-based SMILES tokenizer that preserves chemically meaningful patterns such as ring indices, brackets, and bond operators.
 
 ## Highlights
 
-- SMILES-aware tokenizer for chemistry-preserving sequence encoding
-- Causal language modeling for molecular representation pretraining
-- Regression fine-tuning for downstream LNP property prediction
-- Support for custom CSV datasets and auto-discovered `AGILE/*/*/{train,test}.csv` files
-- Lightweight project layout for reproduction and method extension
+- Chemistry-aware SMILES tokenization
+- Molecular sequence pretraining on Qwen-1.8B
+- Downstream regression fine-tuning and evaluation (RMSE / MAE / Pearson)
+- Support for custom CSVs and AGILE auto-discovery (`AGILE/*/*/{train,test}.csv`)
+- Lightweight layout for reproducibility and extension
 
-## Repository Layout
+## Repository Structure
 
 ```text
-src/
-  tokenizer.py          SMILES tokenizer
-  dataset.py            pretraining dataset pipeline
-  model_regression.py   regression model and data module
 
-data/                   example pretraining data
-AGILE/                  downstream evaluation data
-train_pretrain.py       stage 1 entry point
-train_regression.py     stage 2 entry point
-validate.py             environment and pipeline check
+train_pretrain.py            # Stage 1: SMILES pretraining entry point
+train_regression.py          # Stage 2: regression fine-tuning entry point
+validate_enviroment.py       # Environment and pipeline quick check
+requirements.txt
+config/
+   pretrain_cli.py           # Pretraining CLI arguments
+   regression_cli.py         # Regression CLI arguments
+src/
+   tokenizer.py              # SMILES tokenizer
+   dataset.py                # Pretraining data module
+   model_regression.py       # Regression model and data module
+   pretrain_utils.py
+   regression_utils.py
+   training_common.py
+data/                        # Example pretraining data
+AGILE/                       # Downstream evaluation data
+```
+
+## Quick Start
+
+### 1) Install dependencies
+
+```bash
+pip install -r requirements.txt
+pip install modelscope
+```
+
+### 2) Run environment check
+
+```bash
+python validate_enviroment.py
+```
+
+### 3) Stage 1: pretraining
+
+```bash
+python train_pretrain.py
+```
+
+Common customizations:
+
+```bash
+# Specify data and training epochs
+python train_pretrain.py --csv-paths data/test_lipids.csv --num-epochs 5 --batch-size 4
+
+# GPU selection: single GPU / multi-GPU / all visible GPUs / CPU
+python train_pretrain.py --gpus 0
+python train_pretrain.py --gpus 0,1
+python train_pretrain.py --gpus all
+python train_pretrain.py --gpus cpu
+```
+
+### 4) Stage 2: regression fine-tuning
+
+```bash
+# Use default AGILE subset (defined in regression_cli.py)
+python train_regression.py
+
+# Select a specific AGILE subset
+python train_regression.py --agile-cell-line Hela --agile-split cliff
+
+# Use a custom regression CSV
+python train_regression.py --csv path/to/your_labels.csv
+```
+
+```bash
+# GPU selection
+python train_regression.py --gpus 0
+python train_regression.py --gpus 0,1
+python train_regression.py --gpus all
+python train_regression.py --gpus cpu
 ```
 
 ## Data Format
 
-### Pretraining
-
-The pretraining CSV passed through `train_pretrain.py --csv-paths ...` must contain:
+Pretraining CSV must include:
 
 ```text
 SMILES
 ```
 
-Current default:
-
-```text
-data/test_lipids.csv
-```
-
-### Regression
-
-Regression CSV files must contain:
+Regression CSV must include:
 
 ```text
 SMILES,<TARGET or transfection_efficiency>
@@ -65,69 +117,11 @@ Supported label columns:
 - `TARGET`
 - `transfection_efficiency`
 
-If `--csv` is not provided, the regression script attempts to load `AGILE/*/*/{train,test}.csv`.
-You can optionally filter to one dataset with `--agile-cell-line Hela|RaW --agile-split cliff|scaffold`.
-
-## Quick Start
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
-pip install modelscope
-```
-
-Validate the environment:
-
-```bash
-python validate.py
-```
-
-Run stage 1 pretraining:
-
-```bash
-python train_pretrain.py
-```
-
-Override the default pretraining dataset or hyperparameters:
-
-```bash
-python train_pretrain.py --csv-paths data/test_lipids.csv --num-epochs 5 --batch-size 4
-```
-
-Select a specific GPU or multiple GPUs for pretraining:
-
-```bash
-python train_pretrain.py --gpus 0
-python train_pretrain.py --gpus 0,1
-python train_pretrain.py --gpus all
-```
-
-Run stage 2 regression:
-
-```bash
-python train_regression.py
-
-python train_regression.py --agile-cell-line Hela --agile-split cliff
-```
-
-Use a custom regression dataset:
-
-```bash
-python train_regression.py --csv path/to/your_labels.csv
-```
-
-Select a specific GPU or multiple GPUs for regression:
-
-```bash
-python train_regression.py --gpus 0
-python train_regression.py --gpus 0,1
-python train_regression.py --gpus all
-```
+If `--csv` is not provided, the regression script automatically tries to load `AGILE/*/*/{train,test}.csv`.
 
 ## Outputs
 
-Pretraining outputs are saved to:
+Stage 1 artifacts are saved by default to:
 
 ```text
 models/qwen_1.8b_smiles_pretrained/
@@ -139,10 +133,10 @@ Typical artifacts:
 - `final_model/`
 - `tokenizer.json`
 
-Regression outputs are saved to:
+Stage 2 artifacts are saved by default to:
 
 ```text
-models/qwen_1.8b_smiles_regression/
+models/qwen_1.8b_smiles_regression/<dataset_name>/
 ```
 
 Logs and metrics are written to:
@@ -151,18 +145,17 @@ Logs and metrics are written to:
 logs/
 ```
 
-## Files Most Relevant for Reproduction
+## Key Files for Reproduction
 
-- `train_pretrain.py` for pretraining hyperparameters and data paths
-- `src/tokenizer.py` for SMILES tokenization logic
-- `src/dataset.py` for pretraining sample construction
-- `src/model_regression.py` for regression head design and label normalization
+- `train_pretrain.py`: pretraining pipeline and training loop
+- `train_regression.py`: regression fine-tuning and evaluation
+- `src/tokenizer.py`: SMILES tokenization and encoding logic
+- `src/dataset.py`: pretraining sample construction
+- `src/model_regression.py`: regression head and forward logic
 
-## Use Case
-
-This repository is intended for researchers working on:
+## Use Cases
 
 - LNP molecular representation learning
-- virtual lipid library modeling
-- downstream property prediction from SMILES
-- adaptation of language models to chemical sequence tasks
+- Virtual lipid library modeling
+- SMILES-based property prediction
+- Adapting general language models to chemical sequence tasks

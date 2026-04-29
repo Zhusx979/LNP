@@ -3,7 +3,7 @@
 import argparse
 from typing import Dict
 
-from ..src.training_common import str2bool
+from src.training_common import str2bool
 
 
 def build_config_from_args(args: argparse.Namespace) -> Dict:
