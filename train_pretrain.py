@@ -10,17 +10,14 @@ This script implements a complete training pipeline with:
 """
 
 import logging
-import random
 import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import argparse
+from typing import Dict, List, Optional
 from tqdm import tqdm
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
 import pandas as pd
@@ -36,6 +33,17 @@ PROJECT_ROOT.joinpath("logs").mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(PROJECT_ROOT))
 from src.tokenizer import SMILESTokenizer
 from src.dataset import SMILESDataModule
+from src.logging_utils import configure_logging
+from config.pretrain_cli import build_config_from_args, build_parser
+from src.pretrain_utils import compute_token_accuracy_stats, to_serializable
+from src.qwen_utils import copy_qwen_support_files, ensure_required_dependencies
+from src.training_common import (
+    maybe_enable_data_parallel,
+    resolve_device_config,
+    resolve_path,
+    set_seed,
+    unwrap_data_parallel,
+)
 
 # Try to import transformers
 try:
@@ -47,260 +55,15 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def str2bool(value):
-    """Parse flexible boolean CLI values."""
-    if isinstance(value, bool):
-        return value
-
-    lowered = value.lower()
-    if lowered in {'true', '1', 'yes', 'y', 'on'}:
-        return True
-    if lowered in {'false', '0', 'no', 'n', 'off'}:
-        return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
-
-
-def resolve_path(path_value: str) -> Path:
-    """Resolve a project-relative path."""
-    path = Path(path_value)
-    if path.is_absolute():
-        return path
-    return PROJECT_ROOT / path
-
-
-def configure_logging(logs_dir: Path):
-    """Configure file and console logging once the CLI args are known."""
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(logs_dir / 'training.log'),
-            logging.StreamHandler()
-        ],
-        force=True,
-    )
-
-
-def set_seed(seed: int):
-    """Seed Python, NumPy, and PyTorch for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _compute_token_accuracy_stats(
-    logits: torch.Tensor,
-    target_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> Tuple[int, int, int]:
-    """Count top-1/top-5 correct next-token predictions on non-padding positions."""
-    valid_mask = attention_mask.bool()
-    token_count = int(valid_mask.sum().item())
-    if token_count == 0:
-        return 0, 0, 0
-
-    predictions = logits.argmax(dim=-1)
-    correct_top1 = int(((predictions == target_ids) & valid_mask).sum().item())
-
-    topk = min(5, logits.size(-1))
-    topk_predictions = torch.topk(logits, k=topk, dim=-1).indices
-    correct_top5 = int(
-        (topk_predictions.eq(target_ids.unsqueeze(-1)).any(dim=-1) & valid_mask).sum().item()
-    )
-
-    return correct_top1, correct_top5, token_count
-
-
-def _to_serializable(value):
-    """Convert numpy scalars inside nested structures into builtin Python values."""
-    if isinstance(value, dict):
-        return {key: _to_serializable(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_to_serializable(item) for item in value]
-    if isinstance(value, (np.floating, np.integer)):
-        return value.item()
-    return value
-
-
-def parse_gpu_ids(gpus: Optional[str]) -> List[int]:
-    """Parse GPU selection like '0', '0,1', 'all', or 'cpu'."""
-    if gpus is None:
-        return [0] if torch.cuda.is_available() else []
-
-    normalized = gpus.strip().lower()
-    if normalized in {'cpu', 'none'}:
-        return []
-    if normalized == 'all':
-        if not torch.cuda.is_available():
-            return []
-        return list(range(torch.cuda.device_count()))
-
-    gpu_ids = []
-    for token in gpus.split(','):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            gpu_ids.append(int(token))
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid GPU selection '{gpus}'. Use formats like '0', '0,1', 'all', or 'cpu'."
-            ) from exc
-
-    if not gpu_ids:
-        raise ValueError(
-            f"Invalid GPU selection '{gpus}'. Use formats like '0', '0,1', 'all', or 'cpu'."
-        )
-
-    deduplicated = []
-    for gpu_id in gpu_ids:
-        if gpu_id not in deduplicated:
-            deduplicated.append(gpu_id)
-    return deduplicated
-
-
-def resolve_device_config(gpus: Optional[str]) -> Tuple[torch.device, List[int]]:
-    """Resolve the runtime device and validated GPU ids."""
-    gpu_ids = parse_gpu_ids(gpus)
-    if not gpu_ids:
-        return torch.device('cpu'), []
-
-    if not torch.cuda.is_available():
-        logger.warning("CUDA is unavailable, falling back to CPU.")
-        return torch.device('cpu'), []
-
-    available_gpu_count = torch.cuda.device_count()
-    invalid_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id < 0 or gpu_id >= available_gpu_count]
-    if invalid_gpu_ids:
-        raise ValueError(
-            f"Requested GPU ids {invalid_gpu_ids} but only {available_gpu_count} GPU(s) are available."
-        )
-
-    return torch.device(f'cuda:{gpu_ids[0]}'), gpu_ids
-
-
-def build_config_from_args(args: argparse.Namespace) -> Dict:
-    """Build the nested training config from CLI arguments."""
-    return {
-        'model': {
-            'model_name': args.model_name,
-            'max_seq_length': args.max_seq_length,
-        },
-        'data': {
-            'csv_paths': args.csv_paths,
-            'validation_split': args.validation_split,
-            'batch_size': args.batch_size,
-            'num_workers': args.num_workers,
-            'deduplicate': args.deduplicate,
-        },
-        'training': {
-            'num_epochs': args.num_epochs,
-            'learning_rate': args.learning_rate,
-            'weight_decay': args.weight_decay,
-            'warmup_steps': args.warmup_steps,
-            'gradient_accumulation_steps': args.gradient_accumulation_steps,
-            'max_grad_norm': args.max_grad_norm,
-            'eval_steps': args.eval_steps,
-            'save_steps': args.save_steps,
-            'logging_steps': args.logging_steps,
-            'seed': args.seed,
-        },
-        'optimization': {
-            'mixed_precision': args.mixed_precision,
-            'gradient_checkpointing': args.gradient_checkpointing,
-            'use_amp': args.use_amp,
-            'use_grad_scaler': args.use_grad_scaler,
-        },
-        'paths': {
-            'output_dir': args.output_dir,
-            'logs_dir': args.logs_dir,
-            'tokenizer_path': args.tokenizer_path,
-            'model_cache_dir': args.model_cache_dir,
-        },
-        'runtime': {
-            'gpus': args.gpus,
-        },
-    }
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """Create the CLI argument parser for pretraining."""
-    parser = argparse.ArgumentParser(
-        description='Train Qwen-1.8B for SMILES modeling',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    parser.add_argument('--resume-from', default=None,
-                        help='Path to checkpoint directory to resume from')
-
-    parser.add_argument('--model-name', default='qwen/Qwen-1_8B',
-                        help='Base model name used by ModelScope download')
-    parser.add_argument('--max-seq-length', type=int, default=256,
-                        help='Maximum SMILES sequence length')
-
-    parser.add_argument('--csv-paths', nargs='+', default=['data/test_lipids.csv'],
-                        help='One or more pretraining CSV paths')
-    parser.add_argument('--validation-split', type=float, default=0.15,
-                        help='Validation split ratio')
-    parser.add_argument('--batch-size', type=int, default=1,
-                        help='Training batch size')
-    parser.add_argument('--num-workers', type=int, default=0,
-                        help='Number of DataLoader workers')
-    parser.add_argument('--deduplicate', type=str2bool, nargs='?', const=True, default=False,
-                        help='Whether to deduplicate SMILES samples before training')
-
-    parser.add_argument('--num-epochs', type=int, default=1,
-                        help='Number of training epochs')
-    parser.add_argument('--learning-rate', type=float, default=5e-5,
-                        help='Optimizer learning rate')
-    parser.add_argument('--weight-decay', type=float, default=0.01,
-                        help='AdamW weight decay')
-    parser.add_argument('--warmup-steps', type=int, default=100,
-                        help='Scheduler warmup steps')
-    parser.add_argument('--gradient-accumulation-steps', type=int, default=4,
-                        help='Gradient accumulation steps')
-    parser.add_argument('--max-grad-norm', type=float, default=1.0,
-                        help='Gradient clipping norm')
-    parser.add_argument('--eval-steps', type=int, default=500,
-                        help='Run validation every N optimizer steps')
-    parser.add_argument('--save-steps', type=int, default=500,
-                        help='Save checkpoint every N optimizer steps')
-    parser.add_argument('--logging-steps', type=int, default=50,
-                        help='Log training metrics every N optimizer steps')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for reproducibility')
-
-    parser.add_argument('--mixed-precision', choices=['none', 'fp16', 'bf16'], default='bf16',
-                        help='Mixed precision mode used during training')
-    parser.add_argument('--gradient-checkpointing', type=str2bool, nargs='?', const=True, default=True,
-                        help='Enable gradient checkpointing')
-    parser.add_argument('--use-amp', type=str2bool, nargs='?', const=True, default=True,
-                        help='Compatibility flag kept for old configs; runtime precision is still derived from --mixed-precision')
-    parser.add_argument('--use-grad-scaler', type=str2bool, nargs='?', const=True, default=True,
-                        help='Compatibility flag kept for old configs; scaler usage is still derived from --mixed-precision')
-
-    parser.add_argument('--output-dir', default='models/qwen_1.8b_smiles_pretrained',
-                        help='Directory for checkpoints and final model')
-    parser.add_argument('--logs-dir', default='logs',
-                        help='Directory for training logs and metrics')
-    parser.add_argument('--tokenizer-path', default='models/qwen_1.8b_smiles_pretrained/tokenizer.json',
-                        help='Path for saving the main tokenizer artifact')
-    parser.add_argument('--model-cache-dir', default='models/cache/qwen-1.8b',
-                        help='ModelScope cache directory for downloaded base weights')
-    parser.add_argument('--gpus', default=None,
-                        help="GPU selection: '0' for single GPU, '0,1' for multi-GPU, 'all' for all visible GPUs, or 'cpu'")
-
-    return parser
-
-
 def ensure_transformers():
     """Fail fast when training starts without required dependencies."""
-    if AutoModelForCausalLM is None or get_linear_schedule_with_warmup is None:
-        print("ERROR: transformers not installed. Run: pip install transformers torch")
-        sys.exit(1)
+    ensure_required_dependencies(
+        {
+            "transformers.AutoModelForCausalLM": AutoModelForCausalLM,
+            "transformers.get_linear_schedule_with_warmup": get_linear_schedule_with_warmup,
+        },
+        "pip install transformers torch",
+    )
 
 
 class QwenSMILESPretrainer:
@@ -316,7 +79,8 @@ class QwenSMILESPretrainer:
         """
         self.config = config
         self.device, self.gpu_ids = resolve_device_config(
-            self.config.get('runtime', {}).get('gpus')
+            self.config.get('runtime', {}).get('gpus'),
+            logger=logger,
         )
         self.resume_from = resume_from
         
@@ -327,10 +91,10 @@ class QwenSMILESPretrainer:
         set_seed(self.config['training']['seed'])
         
         # Initialize paths
-        self.output_dir = resolve_path(self.config['paths']['output_dir'])
-        self.logs_dir = resolve_path(self.config['paths']['logs_dir'])
-        self.tokenizer_path = resolve_path(self.config['paths']['tokenizer_path'])
-        self.model_cache_dir = resolve_path(self.config['paths']['model_cache_dir'])
+        self.output_dir = resolve_path(self.config['paths']['output_dir'], PROJECT_ROOT)
+        self.logs_dir = resolve_path(self.config['paths']['logs_dir'], PROJECT_ROOT)
+        self.tokenizer_path = resolve_path(self.config['paths']['tokenizer_path'], PROJECT_ROOT)
+        self.model_cache_dir = resolve_path(self.config['paths']['model_cache_dir'], PROJECT_ROOT)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
@@ -359,22 +123,11 @@ class QwenSMILESPretrainer:
 
     def _unwrap_model(self):
         """Return the underlying model when wrapped by DataParallel."""
-        if isinstance(self.model, torch.nn.DataParallel):
-            return self.model.module
-        return self.model
+        return unwrap_data_parallel(self.model)
 
     def _maybe_enable_data_parallel(self):
         """Wrap the model for multi-GPU training when requested."""
-        if len(self.gpu_ids) <= 1:
-            logger.info("  GPU mode: single device")
-            return
-
-        self.model = torch.nn.DataParallel(
-            self.model,
-            device_ids=self.gpu_ids,
-            output_device=self.gpu_ids[0],
-        )
-        logger.info(f"  GPU mode: DataParallel on GPUs {self.gpu_ids}")
+        self.model = maybe_enable_data_parallel(self.model, self.gpu_ids, logger=logger)
     
     def setup(self):
         """Initialize tokenizer, data module, and model."""
@@ -611,7 +364,7 @@ class QwenSMILESPretrainer:
             
             # Accumulate metrics
             total_loss += raw_loss.item()
-            batch_top1_correct, batch_top5_correct, batch_token_count = _compute_token_accuracy_stats(
+            batch_top1_correct, batch_top5_correct, batch_token_count = compute_token_accuracy_stats(
                 outputs.logits.detach(),
                 batch['target_ids'],
                 batch['attention_mask'],
@@ -725,7 +478,7 @@ class QwenSMILESPretrainer:
             
             total_loss += loss.item() * batch['input_ids'].size(0)
             total_samples += batch['input_ids'].size(0)
-            batch_top1_correct, batch_top5_correct, batch_token_count = _compute_token_accuracy_stats(
+            batch_top1_correct, batch_top5_correct, batch_token_count = compute_token_accuracy_stats(
                 outputs.logits.detach(),
                 batch['target_ids'],
                 batch['attention_mask'],
@@ -803,22 +556,7 @@ class QwenSMILESPretrainer:
 
     def _copy_qwen_support_files(self, target_dir: Path):
         """Copy trust_remote_code support files so local checkpoints are reloadable."""
-        if self.model_source_dir is None or not self.model_source_dir.exists():
-            return
-
-        support_files = [
-            "modeling_qwen.py",
-            "configuration_qwen.py",
-            "qwen_generation_utils.py",
-            "tokenization_qwen.py",
-            "cpp_kernels.py",
-        ]
-
-        for filename in support_files:
-            source = self.model_source_dir / filename
-            destination = target_dir / filename
-            if source.exists() and not destination.exists():
-                shutil.copy2(source, destination)
+        copy_qwen_support_files(self.model_source_dir, target_dir)
     
     def train(self):
         """Main training loop."""
@@ -896,7 +634,7 @@ class QwenSMILESPretrainer:
             }
             summary_path = self.logs_dir / "pretrain_summary.json"
             with open(summary_path, 'w', encoding='utf-8') as handle:
-                json.dump(_to_serializable(summary), handle, ensure_ascii=False, indent=2)
+                json.dump(to_serializable(summary), handle, ensure_ascii=False, indent=2)
             logger.info(f"Summary saved: {summary_path}")
             
             logger.info("="*60)
@@ -909,7 +647,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     config = build_config_from_args(args)
-    configure_logging(resolve_path(config['paths']['logs_dir']))
+    configure_logging(resolve_path(config['paths']['logs_dir'], PROJECT_ROOT))
     
     # Create trainer
     trainer = QwenSMILESPretrainer(config, args.resume_from)

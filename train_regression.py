@@ -13,14 +13,10 @@ This script will:
 """
 
 import logging
-import random
-import re
-import shutil
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Tuple
 import json
-import argparse
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -28,15 +24,30 @@ from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import explained_variance_score, median_absolute_error, r2_score
 
 # Import custom modules
 PROJECT_ROOT = Path(__file__).parent
 PROJECT_ROOT.joinpath("logs").mkdir(parents=True, exist_ok=True)
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT))
 from src.model_regression import QwenRegressionModel, RegressionDataModule
 from src.tokenizer import SMILESTokenizer
+from src.logging_utils import configure_logging
+from src.qwen_utils import ensure_local_qwen_code, ensure_required_dependencies
+from config.regression_cli import build_config_from_args, build_parser
+from src.regression_utils import (
+    compute_regression_metrics,
+    infer_regression_dataset_name,
+    json_ready_dict,
+    safe_correlation,
+    to_builtin,
+)
+from src.training_common import (
+    maybe_enable_data_parallel,
+    resolve_device_config,
+    resolve_path,
+    set_seed,
+    unwrap_data_parallel,
+)
 
 try:
     from transformers import AutoModelForCausalLM
@@ -46,339 +57,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-
-
-def str2bool(value):
-    """Parse flexible boolean CLI values."""
-    if isinstance(value, bool):
-        return value
-
-    lowered = value.lower()
-    if lowered in {'true', '1', 'yes', 'y', 'on'}:
-        return True
-    if lowered in {'false', '0', 'no', 'n', 'off'}:
-        return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
-
-
-def resolve_path(path_value: str) -> Path:
-    """Resolve a project-relative path."""
-    path = Path(path_value)
-    if path.is_absolute():
-        return path
-    return PROJECT_ROOT / path
-
-
-def configure_logging(logs_dir: Path, dataset_name: Optional[str] = None):
-    """Configure file and console logging once CLI args are known."""
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_filename = (
-        f"regression_training_{dataset_name}.log"
-        if dataset_name
-        else "regression_training.log"
-    )
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(logs_dir / log_filename),
-            logging.StreamHandler()
-        ],
-        force=True,
-    )
-
-
-def set_seed(seed: int):
-    """Seed Python, NumPy, and PyTorch for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def sanitize_artifact_name(value: str) -> str:
-    """Create a filesystem-friendly dataset identifier."""
-    normalized = re.sub(r'[^A-Za-z0-9._-]+', '_', value.strip())
-    normalized = normalized.strip('._-')
-    return normalized or "dataset"
-
-
-def infer_regression_dataset_name(
-    csv_path: Optional[str],
-    auto_discover_agile: bool,
-    agile_cell_line: Optional[str],
-    agile_split: Optional[str],
-) -> str:
-    """Infer a stable dataset name for run artifacts."""
-    if csv_path:
-        return sanitize_artifact_name(Path(csv_path).stem)
-
-    if auto_discover_agile:
-        return sanitize_artifact_name(
-            f"AGILE_{agile_cell_line or 'ALL'}_{agile_split or 'ALL'}"
-        )
-
-    return "regression_run"
-
-
-def parse_gpu_ids(gpus: Optional[str]) -> List[int]:
-    """Parse GPU selection like '0', '0,1', 'all', or 'cpu'."""
-    if gpus is None:
-        return [0] if torch.cuda.is_available() else []
-
-    normalized = gpus.strip().lower()
-    if normalized in {'cpu', 'none'}:
-        return []
-    if normalized == 'all':
-        if not torch.cuda.is_available():
-            return []
-        return list(range(torch.cuda.device_count()))
-
-    gpu_ids = []
-    for token in gpus.split(','):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            gpu_ids.append(int(token))
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid GPU selection '{gpus}'. Use formats like '0', '0,1', 'all', or 'cpu'."
-            ) from exc
-
-    if not gpu_ids:
-        raise ValueError(
-            f"Invalid GPU selection '{gpus}'. Use formats like '0', '0,1', 'all', or 'cpu'."
-        )
-
-    deduplicated = []
-    for gpu_id in gpu_ids:
-        if gpu_id not in deduplicated:
-            deduplicated.append(gpu_id)
-    return deduplicated
-
-
-def resolve_device_config(gpus: Optional[str]) -> Tuple[torch.device, List[int]]:
-    """Resolve the runtime device and validated GPU ids."""
-    gpu_ids = parse_gpu_ids(gpus)
-    if not gpu_ids:
-        return torch.device('cpu'), []
-
-    if not torch.cuda.is_available():
-        logger.warning("CUDA is unavailable, falling back to CPU.")
-        return torch.device('cpu'), []
-
-    available_gpu_count = torch.cuda.device_count()
-    invalid_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id < 0 or gpu_id >= available_gpu_count]
-    if invalid_gpu_ids:
-        raise ValueError(
-            f"Requested GPU ids {invalid_gpu_ids} but only {available_gpu_count} GPU(s) are available."
-        )
-
-    return torch.device(f'cuda:{gpu_ids[0]}'), gpu_ids
-
-
 def ensure_transformers():
     """Fail fast when training starts without required dependencies."""
-    if AutoModelForCausalLM is None:
-        print("ERROR: transformers not installed. Run: pip install -r requirements.txt")
-        sys.exit(1)
-
-
-def ensure_local_qwen_code(model_dir: Path):
-    """Copy missing Qwen trust_remote_code files into a saved local model directory."""
-    config_path = model_dir / 'config.json'
-    if not config_path.exists():
-        return
-
-    required_files = [
-        'modeling_qwen.py',
-        'configuration_qwen.py',
-        'qwen_generation_utils.py',
-        'tokenization_qwen.py',
-        'cpp_kernels.py',
-    ]
-    missing_files = [name for name in required_files if not (model_dir / name).exists()]
-    if not missing_files:
-        return
-
-    with open(config_path, 'r', encoding='utf-8') as handle:
-        config = json.load(handle)
-
-    source_dir = config.get('_name_or_path')
-    if not source_dir:
-        return
-
-    source_path = Path(source_dir)
-    if not source_path.exists():
-        return
-
-    copied_files = []
-    for filename in missing_files:
-        source_file = source_path / filename
-        destination_file = model_dir / filename
-        if source_file.exists():
-            shutil.copy2(source_file, destination_file)
-            copied_files.append(filename)
-
-    if copied_files:
-        logger.info(
-            "Copied Qwen support files into %s: %s",
-            model_dir,
-            ", ".join(copied_files),
-        )
-
-
-def build_config_from_args(args: argparse.Namespace) -> Dict:
-    """Build the nested training config from CLI arguments."""
-    return {
-        'model': {
-            'mixed_precision': args.mixed_precision,
-            'full_finetune': args.full_finetune,
-            'train_embeddings': args.train_embeddings,
-            'use_amp': args.use_amp,
-            'use_grad_scaler': args.use_grad_scaler,
-        },
-        'data': {
-            'csv_path': args.csv,
-            'batch_size': args.batch_size,
-            'auto_discover_agile': not args.no_auto_discover,
-            'agile_cell_line': args.agile_cell_line,
-            'agile_split': args.agile_split,
-        },
-        'training': {
-            'num_epochs': args.num_epochs,
-            'learning_rate': args.learning_rate,
-            'gradient_accumulation_steps': args.gradient_accumulation_steps,
-            'max_grad_norm': args.max_grad_norm,
-            'weight_decay': args.weight_decay,
-            'seed': args.seed,
-        },
-        'paths': {
-            'pretrained_model_path': args.pretrained_model_path,
-            'tokenizer_path': args.tokenizer_path,
-            'output_dir': args.output_dir,
-            'logs_dir': args.logs_dir,
-        },
-        'runtime': {
-            'gpus': args.gpus,
-        },
-    }
-
-# Edit these defaults if you want to choose an AGILE subset
-# without passing command-line arguments.
-DEFAULT_REGRESSION_CSV = None
-DEFAULT_AGILE_CELL_LINE = 'Hela'
-DEFAULT_AGILE_SPLIT = 'scaffold'
-def build_parser() -> argparse.ArgumentParser:
-    """Create the CLI argument parser for regression fine-tuning."""
-    parser = argparse.ArgumentParser(
-        description='Fine-tune Qwen for transfection efficiency regression',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Train with the dataset defaults defined in this script
-  python train_regression.py
-  
-  # Train only on AGILE/Hela/cliff
-  python train_regression.py --agile-cell-line Hela --agile-split cliff
-
-  # Use manual CSV
-  python train_regression.py --csv path/to/labels.csv
-  
-  # Custom settings
-  python train_regression.py --num-epochs 20 --learning-rate 5e-6
-        """,
+    ensure_required_dependencies(
+        {"transformers.AutoModelForCausalLM": AutoModelForCausalLM},
+        "pip install -r requirements.txt",
     )
-    parser.add_argument('--pretrained-model-path', '--pretrained_model_path',
-                        dest='pretrained_model_path',
-                        default='models/qwen_1.8b_smiles_pretrained/final_model',
-                        help='Path to pretrained model from Stage 1')
-    parser.add_argument('--tokenizer-path', '--tokenizer_path',
-                        dest='tokenizer_path',
-                        default='models/qwen_1.8b_smiles_pretrained/tokenizer.json',
-                        help='Path to tokenizer')
-    parser.add_argument('--csv', default=DEFAULT_REGRESSION_CSV,
-                        help='Path to regression CSV (optional, auto-discovers AGILE if not provided)')
-    parser.add_argument('--output-dir', '--output',
-                        dest='output_dir',
-                        default='models/qwen_1.8b_smiles_regression',
-                        help='Output directory')
-    parser.add_argument('--logs-dir', default='logs',
-                        help='Directory for regression logs and metrics')
-    parser.add_argument('--no-auto-discover', action='store_true',
-                        help='Disable AGILE auto-discovery')
-    parser.add_argument('--agile-cell-line', default=DEFAULT_AGILE_CELL_LINE,
-                        help='Filter AGILE by cell line: Hela or RaW')
-    parser.add_argument('--agile-split', default=DEFAULT_AGILE_SPLIT,
-                        help='Filter AGILE by split type: cliff or scaffold')
-
-    parser.add_argument('--num-epochs', '--epochs',
-                        dest='num_epochs',
-                        type=int,
-                        default=1,
-                        help='Number of epochs')
-    parser.add_argument('--batch-size', '--batch',
-                        dest='batch_size',
-                        type=int,
-                        default=1,
-                        help='Batch size')
-    parser.add_argument('--learning-rate', '--lr',
-                        dest='learning_rate',
-                        type=float,
-                        default=1e-5,
-                        help='Learning rate')
-    parser.add_argument('--gradient-accumulation-steps', '--gradient_accumulation_steps',
-                        dest='gradient_accumulation_steps',
-                        type=int,
-                        default=4,
-                        help='Gradient accumulation steps')
-    parser.add_argument('--max-grad-norm', '--max_grad_norm',
-                        dest='max_grad_norm',
-                        type=float,
-                        default=1.0,
-                        help='Gradient clipping norm')
-    parser.add_argument('--weight-decay', type=float, default=0.001,
-                        help='AdamW weight decay')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for reproducibility')
-
-    parser.add_argument('--mixed-precision', '--mixed_precision',
-                        dest='mixed_precision',
-                        choices=['none', 'fp16', 'bf16'], default='bf16',
-                        help='Mixed precision mode used during training')
-    parser.add_argument('--use-amp', '--use_amp',
-                        dest='use_amp',
-                        type=str2bool,
-                        nargs='?',
-                        const=True,
-                        default=True,
-                        help='Compatibility flag kept for old configs; runtime precision is still derived from --mixed-precision')
-    parser.add_argument('--use-grad-scaler', '--use_grad_scaler',
-                        dest='use_grad_scaler',
-                        type=str2bool,
-                        nargs='?',
-                        const=True,
-                        default=True,
-                        help='Compatibility flag kept for old configs; scaler usage is still derived from --mixed-precision')
-    parser.add_argument('--full-finetune', '--full_finetune',
-                        dest='full_finetune',
-                        action='store_true',
-                        help='Train the entire backbone instead of freezing it')
-    parser.add_argument('--train-embeddings',
-                        dest='train_embeddings',
-                        action='store_true',
-                        default=True,
-                        help='Keep resized input embeddings trainable when backbone is frozen')
-    parser.add_argument('--no-train-embeddings',
-                        dest='train_embeddings',
-                        action='store_false',
-                        help='Freeze resized input embeddings together with the backbone')
-    parser.add_argument('--gpus', default=None,
-                        help="GPU selection: '0' for single GPU, '0,1' for multi-GPU, 'all' for all visible GPUs, or 'cpu'")
-
-    return parser
 
 
 class QwenRegressionTrainer:
@@ -412,15 +96,15 @@ class QwenRegressionTrainer:
             agile_split=self.data_config.get('agile_split'),
         )
 
-        self.pretrained_model_path = resolve_path(self.paths_config['pretrained_model_path'])
-        self.tokenizer_path = resolve_path(self.paths_config['tokenizer_path'])
-        self.output_root_dir = resolve_path(self.paths_config['output_dir'])
+        self.pretrained_model_path = resolve_path(self.paths_config['pretrained_model_path'], PROJECT_ROOT)
+        self.tokenizer_path = resolve_path(self.paths_config['tokenizer_path'], PROJECT_ROOT)
+        self.output_root_dir = resolve_path(self.paths_config['output_dir'], PROJECT_ROOT)
         self.output_dir = self.output_root_dir / self.dataset_name
-        self.logs_dir = resolve_path(self.paths_config['logs_dir'])
+        self.logs_dir = resolve_path(self.paths_config['logs_dir'], PROJECT_ROOT)
 
         self._validate_inputs(self.pretrained_model_path, self.tokenizer_path)
         self.regression_csv = (
-            str(resolve_path(self.data_config['csv_path']))
+            str(resolve_path(self.data_config['csv_path'], PROJECT_ROOT))
             if self.data_config['csv_path'] is not None
             else None
         )
@@ -431,7 +115,10 @@ class QwenRegressionTrainer:
         self.agile_cell_line = self.data_config.get('agile_cell_line')
         self.agile_split = self.data_config.get('agile_split')
         
-        self.device, self.gpu_ids = resolve_device_config(self.runtime_config.get('gpus'))
+        self.device, self.gpu_ids = resolve_device_config(
+            self.runtime_config.get('gpus'),
+            logger=logger,
+        )
         logger.info(f"Device: {self.device}")
         logger.info(f"CUDA available: {torch.cuda.is_available()}")
         logger.info(f"GPU ids: {self.gpu_ids if self.gpu_ids else 'CPU only'}")
@@ -468,16 +155,7 @@ class QwenRegressionTrainer:
     @staticmethod
     def _safe_correlation(fn, y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
         """Compute correlation safely for short or constant arrays."""
-        if len(y_true) < 2:
-            return float('nan'), float('nan')
-        if np.isclose(np.std(y_true), 0.0) or np.isclose(np.std(y_pred), 0.0):
-            return float('nan'), float('nan')
-
-        try:
-            corr, p_value = fn(y_true, y_pred)
-        except Exception:
-            return float('nan'), float('nan')
-        return float(corr), float(p_value)
+        return safe_correlation(fn, y_true, y_pred)
 
     @classmethod
     def _compute_regression_metrics(
@@ -486,122 +164,24 @@ class QwenRegressionTrainer:
         y_pred: np.ndarray,
     ) -> Dict[str, float]:
         """Compute a comprehensive set of regression metrics."""
-        if len(y_true) == 0:
-            return {
-                'mse': float('nan'),
-                'rmse': float('nan'),
-                'mae': float('nan'),
-                'median_ae': float('nan'),
-                'r2': float('nan'),
-                'explained_variance': float('nan'),
-                'pearson_r': float('nan'),
-                'pearson_pvalue': float('nan'),
-                'spearman_r': float('nan'),
-                'spearman_pvalue': float('nan'),
-                'mean_error': float('nan'),
-                'std_error': float('nan'),
-                'max_abs_error': float('nan'),
-                'smape': float('nan'),
-                'mape_nonzero': float('nan'),
-                'nrmse_range': float('nan'),
-                'nrmse_std': float('nan'),
-            }
-
-        errors = y_pred - y_true
-        abs_errors = np.abs(errors)
-        mse = float(np.mean(np.square(errors)))
-        rmse = float(np.sqrt(mse))
-        mae = float(np.mean(abs_errors))
-        median_ae = float(median_absolute_error(y_true, y_pred))
-        mean_error = float(np.mean(errors))
-        std_error = float(np.std(errors))
-        max_abs_error = float(np.max(abs_errors))
-
-        pearson_r, pearson_pvalue = cls._safe_correlation(pearsonr, y_true, y_pred)
-        spearman_r, spearman_pvalue = cls._safe_correlation(spearmanr, y_true, y_pred)
-
-        y_range = float(np.max(y_true) - np.min(y_true)) if len(y_true) else float('nan')
-        y_std = float(np.std(y_true)) if len(y_true) else float('nan')
-        nrmse_range = float(rmse / y_range) if y_range and not np.isclose(y_range, 0.0) else float('nan')
-        nrmse_std = float(rmse / y_std) if y_std and not np.isclose(y_std, 0.0) else float('nan')
-
-        denominator = np.abs(y_true) + np.abs(y_pred) + 1e-12
-        smape = float(np.mean(2.0 * abs_errors / denominator) * 100.0)
-        non_zero_mask = np.abs(y_true) > 1e-12
-        if np.any(non_zero_mask):
-            mape_nonzero = float(
-                np.mean(abs_errors[non_zero_mask] / np.abs(y_true[non_zero_mask])) * 100.0
-            )
-        else:
-            mape_nonzero = float('nan')
-
-        if len(y_true) >= 2:
-            r2 = float(r2_score(y_true, y_pred))
-            explained_variance = float(explained_variance_score(y_true, y_pred))
-        else:
-            r2 = float('nan')
-            explained_variance = float('nan')
-
-        return {
-            'mse': mse,
-            'rmse': rmse,
-            'mae': mae,
-            'median_ae': median_ae,
-            'r2': r2,
-            'explained_variance': explained_variance,
-            'pearson_r': pearson_r,
-            'pearson_pvalue': pearson_pvalue,
-            'spearman_r': spearman_r,
-            'spearman_pvalue': spearman_pvalue,
-            'mean_error': mean_error,
-            'std_error': std_error,
-            'max_abs_error': max_abs_error,
-            'smape': smape,
-            'mape_nonzero': mape_nonzero,
-            'nrmse_range': nrmse_range,
-            'nrmse_std': nrmse_std,
-        }
+        return compute_regression_metrics(y_true, y_pred)
 
     @staticmethod
     def _to_builtin(value):
         """Convert numpy/pandas scalars to JSON-serializable Python values."""
-        if isinstance(value, (np.floating, np.integer)):
-            return value.item()
-        return value
+        return to_builtin(value)
 
     def _json_ready_dict(self, data: Dict) -> Dict:
         """Recursively convert metrics dictionaries for JSON serialization."""
-        json_ready = {}
-        for key, value in data.items():
-            if isinstance(value, dict):
-                json_ready[key] = self._json_ready_dict(value)
-            elif isinstance(value, list):
-                json_ready[key] = [
-                    self._json_ready_dict(item) if isinstance(item, dict) else self._to_builtin(item)
-                    for item in value
-                ]
-            else:
-                json_ready[key] = self._to_builtin(value)
-        return json_ready
+        return json_ready_dict(data)
 
     def _unwrap_model(self):
         """Return the underlying model when wrapped by DataParallel."""
-        if isinstance(self.model, torch.nn.DataParallel):
-            return self.model.module
-        return self.model
+        return unwrap_data_parallel(self.model)
 
     def _maybe_enable_data_parallel(self):
         """Wrap the model for multi-GPU training when requested."""
-        if len(self.gpu_ids) <= 1:
-            logger.info("  GPU mode: single device")
-            return
-
-        self.model = torch.nn.DataParallel(
-            self.model,
-            device_ids=self.gpu_ids,
-            output_device=self.gpu_ids[0],
-        )
-        logger.info(f"  GPU mode: DataParallel on GPUs {self.gpu_ids}")
+        self.model = maybe_enable_data_parallel(self.model, self.gpu_ids, logger=logger)
     
     @staticmethod
     def _validate_inputs(pretrained_path: Path, tokenizer_path: Path):
@@ -645,7 +225,13 @@ class QwenRegressionTrainer:
 
         # Load pretrained model
         logger.info("[2/3] Loading pretrained Qwen model...")
-        ensure_local_qwen_code(self.pretrained_model_path)
+        copied_qwen_files = ensure_local_qwen_code(self.pretrained_model_path)
+        if copied_qwen_files:
+            logger.info(
+                "Copied Qwen support files into %s: %s",
+                self.pretrained_model_path,
+                ", ".join(copied_qwen_files),
+            )
         mixed_precision = self.model_config['mixed_precision']
         if torch.cuda.is_available() and mixed_precision == 'fp16':
             self.amp_dtype = torch.float16
@@ -1022,7 +608,10 @@ def main():
         agile_cell_line=config['data'].get('agile_cell_line'),
         agile_split=config['data'].get('agile_split'),
     )
-    configure_logging(resolve_path(config['paths']['logs_dir']), dataset_name=dataset_name)
+    configure_logging(
+        resolve_path(config['paths']['logs_dir'], PROJECT_ROOT),
+        log_filename=f"regression_training_{dataset_name}.log",
+    )
     
     logger.info("="*70)
     logger.info("STAGE 2: TRANSFECTION EFFICIENCY REGRESSION")
