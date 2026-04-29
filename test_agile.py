@@ -1,7 +1,7 @@
 """
-Quick test for AGILE dataset auto-discovery.
+Quick test for AGILE dataset auto-discovery and filtering.
 
-Run this to verify that all AGILE datasets are discovered correctly.
+Run this to verify that AGILE datasets are discovered and filtered correctly.
 """
 
 import sys
@@ -25,14 +25,16 @@ def test_agile_discovery():
     print("AGILE DATASET AUTO-DISCOVERY TEST")
     print("="*70 + "\n")
     
-    # Discover CSV files
-    csv_files = RegressionDataModule.discover_agile_csvs("AGILE")
+    train_csv_files = RegressionDataModule.discover_agile_csvs("AGILE", csv_name="train.csv")
+    test_csv_files = RegressionDataModule.discover_agile_csvs("AGILE", csv_name="test.csv")
+    csv_files = train_csv_files + test_csv_files
     
     if not csv_files:
         print("FAILED: No AGILE CSV files discovered")
         return False
     
-    print(f"Discovered {len(csv_files)} CSV files\n")
+    print(f"Discovered {len(train_csv_files)} train.csv files")
+    print(f"Discovered {len(test_csv_files)} test.csv files\n")
     
     # Test loading each file
     total_rows = 0
@@ -59,6 +61,18 @@ def test_agile_discovery():
             return False
     
     print(f"\nTotal samples: {total_rows}")
+
+    filtered = RegressionDataModule.discover_agile_csvs(
+        "AGILE",
+        cell_line="Hela",
+        split_name="cliff",
+        csv_name="train.csv",
+    )
+    if len(filtered) != 1:
+        print("\nFAILED: Hela/cliff filter did not return exactly one train.csv")
+        return False
+    print(f"Filter check passed: {Path(filtered[0]).relative_to('AGILE')}")
+
     print("\n" + "="*70)
     return True
 
@@ -90,10 +104,12 @@ def test_data_loading():
             tokenizer=tokenizer,
             auto_discover_agile=True,
             batch_size=32,
+            agile_cell_line="Hela",
+            agile_split="cliff",
         )
         
         # Load data
-        logger.info("Loading AGILE datasets...")
+        logger.info("Loading AGILE datasets for Hela/cliff...")
         smiles_list, labels = data_module.load_data()
         
         print(f"\n Loaded {len(smiles_list)} SMILES-label pairs")

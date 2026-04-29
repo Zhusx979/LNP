@@ -18,7 +18,7 @@ Instead of using a generic text tokenizer, the codebase includes a rule-based SM
 - SMILES-aware tokenizer for chemistry-preserving sequence encoding
 - Causal language modeling for molecular representation pretraining
 - Regression fine-tuning for downstream LNP property prediction
-- Support for custom CSV datasets and auto-discovered `AGILE/**/test.csv` files
+- Support for custom CSV datasets and auto-discovered `AGILE/*/*/{train,test}.csv` files
 - Lightweight project layout for reproduction and method extension
 
 ## Repository Layout
@@ -65,7 +65,8 @@ Supported label columns:
 - `TARGET`
 - `transfection_efficiency`
 
-If `--csv` is not provided, the regression script attempts to load `AGILE/**/test.csv`.
+If `--csv` is not provided, the regression script attempts to load `AGILE/*/*/{train,test}.csv`.
+You can optionally filter to one dataset with `--agile-cell-line Hela|RaW --agile-split cliff|scaffold`.
 
 ## Quick Start
 
@@ -106,6 +107,8 @@ Run stage 2 regression:
 
 ```bash
 python train_regression.py
+
+python train_regression.py --agile-cell-line Hela --agile-split cliff
 ```
 
 Use a custom regression dataset:

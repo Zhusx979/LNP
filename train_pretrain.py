@@ -11,6 +11,7 @@ This script implements a complete training pipeline with:
 
 import logging
 import random
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -88,6 +89,40 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _compute_token_accuracy_stats(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> Tuple[int, int, int]:
+    """Count top-1/top-5 correct next-token predictions on non-padding positions."""
+    valid_mask = attention_mask.bool()
+    token_count = int(valid_mask.sum().item())
+    if token_count == 0:
+        return 0, 0, 0
+
+    predictions = logits.argmax(dim=-1)
+    correct_top1 = int(((predictions == target_ids) & valid_mask).sum().item())
+
+    topk = min(5, logits.size(-1))
+    topk_predictions = torch.topk(logits, k=topk, dim=-1).indices
+    correct_top5 = int(
+        (topk_predictions.eq(target_ids.unsqueeze(-1)).any(dim=-1) & valid_mask).sum().item()
+    )
+
+    return correct_top1, correct_top5, token_count
+
+
+def _to_serializable(value):
+    """Convert numpy scalars inside nested structures into builtin Python values."""
+    if isinstance(value, dict):
+        return {key: _to_serializable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_serializable(item) for item in value]
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    return value
 
 
 def parse_gpu_ids(gpus: Optional[str]) -> List[int]:
@@ -319,6 +354,8 @@ class QwenSMILESPretrainer:
         
         # Metrics tracking
         self.metrics_df = None
+        self.validation_history = []
+        self.best_val_metrics = None
 
     def _unwrap_model(self):
         """Return the underlying model when wrapped by DataParallel."""
@@ -536,6 +573,10 @@ class QwenSMILESPretrainer:
         """
         self.model.train()
         total_loss = 0.0
+        total_top1_correct = 0
+        total_top5_correct = 0
+        total_tokens = 0
+        total_sequences = 0
         gradient_accumulation_steps = self.config['training']['gradient_accumulation_steps']
         logging_steps = self.config['training']['logging_steps']
         
@@ -570,6 +611,15 @@ class QwenSMILESPretrainer:
             
             # Accumulate metrics
             total_loss += raw_loss.item()
+            batch_top1_correct, batch_top5_correct, batch_token_count = _compute_token_accuracy_stats(
+                outputs.logits.detach(),
+                batch['target_ids'],
+                batch['attention_mask'],
+            )
+            total_top1_correct += batch_top1_correct
+            total_top5_correct += batch_top5_correct
+            total_tokens += batch_token_count
+            total_sequences += batch['input_ids'].size(0)
             
             # Update weights every accumulation step
             should_step = (
@@ -606,13 +656,18 @@ class QwenSMILESPretrainer:
                     )
 
                 if self.current_step % self.config['training']['eval_steps'] == 0:
-                    val_loss = self.validate()
+                    val_metrics = self.validate(record_history=True, context='step_eval')
                     self.model.train()  # Resume training mode
 
-                    if val_loss < self.best_val_loss:
-                        self.best_val_loss = val_loss
+                    if val_metrics['val_loss'] < self.best_val_loss:
+                        self.best_val_loss = val_metrics['val_loss']
+                        self.best_val_metrics = {
+                            'epoch': self.current_epoch + 1,
+                            'step': self.current_step,
+                            **val_metrics,
+                        }
                         self.save_checkpoint(is_best=True)
-                        logger.info(f"New best validation loss: {val_loss:.4f}")
+                        logger.info(f"New best validation loss: {val_metrics['val_loss']:.4f}")
 
                 if self.current_step % self.config['training']['save_steps'] == 0:
                     self.save_checkpoint()
@@ -622,22 +677,40 @@ class QwenSMILESPretrainer:
         epoch_perplexity = np.exp(epoch_loss)
         
         return {
-            'epoch': epoch,
+            'epoch': epoch + 1,
             'train_loss': epoch_loss,
             'train_perplexity': epoch_perplexity,
+            'train_token_accuracy': (
+                total_top1_correct / total_tokens if total_tokens else float('nan')
+            ),
+            'train_top5_token_accuracy': (
+                total_top5_correct / total_tokens if total_tokens else float('nan')
+            ),
+            'train_token_count': total_tokens,
+            'train_sequence_count': total_sequences,
+            'learning_rate': self.optimizer.param_groups[0]['lr'],
+            'optimizer_steps': self.current_step,
         }
     
     @torch.no_grad()
-    def validate(self) -> float:
+    def validate(
+        self,
+        record_history: bool = True,
+        context: str = "epoch_end",
+        epoch: Optional[int] = None,
+    ) -> Dict[str, float]:
         """
         Run validation.
         
         Returns:
-            Validation loss
+            Validation metrics
         """
         self.model.eval()
         total_loss = 0.0
         total_samples = 0
+        total_top1_correct = 0
+        total_top5_correct = 0
+        total_tokens = 0
         
         for batch in tqdm(self.val_loader):
             batch = {k: v.to(self.device) for k, v in batch.items()}
@@ -652,13 +725,49 @@ class QwenSMILESPretrainer:
             
             total_loss += loss.item() * batch['input_ids'].size(0)
             total_samples += batch['input_ids'].size(0)
+            batch_top1_correct, batch_top5_correct, batch_token_count = _compute_token_accuracy_stats(
+                outputs.logits.detach(),
+                batch['target_ids'],
+                batch['attention_mask'],
+            )
+            total_top1_correct += batch_top1_correct
+            total_top5_correct += batch_top5_correct
+            total_tokens += batch_token_count
         
-        avg_val_loss = total_loss / total_samples
-        val_perplexity = np.exp(avg_val_loss)
+        avg_val_loss = total_loss / total_samples if total_samples else float('nan')
+        val_perplexity = np.exp(avg_val_loss) if total_samples else float('nan')
+        val_metrics = {
+            'val_loss': avg_val_loss,
+            'val_perplexity': val_perplexity,
+            'val_token_accuracy': (
+                total_top1_correct / total_tokens if total_tokens else float('nan')
+            ),
+            'val_top5_token_accuracy': (
+                total_top5_correct / total_tokens if total_tokens else float('nan')
+            ),
+            'val_token_count': total_tokens,
+            'val_sequence_count': total_samples,
+        }
         
-        logger.info(f"  Validation | Loss: {avg_val_loss:.4f} | Perplexity: {val_perplexity:.4f}")
+        logger.info(
+            "  Validation | Loss: %.4f | Perplexity: %.4f | Token Acc: %.4f | Top5 Acc: %.4f",
+            val_metrics['val_loss'],
+            val_metrics['val_perplexity'],
+            val_metrics['val_token_accuracy'],
+            val_metrics['val_top5_token_accuracy'],
+        )
+
+        if record_history:
+            self.validation_history.append(
+                {
+                    'context': context,
+                    'epoch': (epoch + 1) if epoch is not None else (self.current_epoch + 1),
+                    'step': self.current_step,
+                    **val_metrics,
+                }
+            )
         
-        return avg_val_loss
+        return val_metrics
     
     def save_checkpoint(self, is_best: bool = False):
         """Save model checkpoint."""
@@ -729,21 +838,28 @@ class QwenSMILESPretrainer:
                 metrics_history.append(epoch_metrics)
                 
                 # Validate at end of epoch
-                val_loss = self.validate()
-                epoch_metrics['val_loss'] = val_loss
-                epoch_metrics['val_perplexity'] = np.exp(val_loss)
+                val_metrics = self.validate(record_history=True, context='epoch_end', epoch=epoch)
+                epoch_metrics.update(val_metrics)
                 
                 # Check for new best
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
+                if val_metrics['val_loss'] < self.best_val_loss:
+                    self.best_val_loss = val_metrics['val_loss']
+                    self.best_val_metrics = {
+                        'epoch': epoch + 1,
+                        'step': self.current_step,
+                        **val_metrics,
+                    }
                     self.save_checkpoint(is_best=True)
                 
                 # Log epoch summary
                 logger.info(f"\nEpoch {epoch + 1} Summary:")
                 logger.info(f"  Train Loss: {epoch_metrics['train_loss']:.4f}")
                 logger.info(f"  Train Perplexity: {epoch_metrics['train_perplexity']:.4f}")
-                logger.info(f"  Val Loss: {val_loss:.4f}")
-                logger.info(f"  Val Perplexity: {np.exp(val_loss):.4f}")
+                logger.info(f"  Train Token Acc: {epoch_metrics['train_token_accuracy']:.4f}")
+                logger.info(f"  Val Loss: {epoch_metrics['val_loss']:.4f}")
+                logger.info(f"  Val Perplexity: {epoch_metrics['val_perplexity']:.4f}")
+                logger.info(f"  Val Token Acc: {epoch_metrics['val_token_accuracy']:.4f}")
+                logger.info(f"  Val Top5 Token Acc: {epoch_metrics['val_top5_token_accuracy']:.4f}")
         
         except KeyboardInterrupt:
             logger.info("Training interrupted by user")
@@ -764,6 +880,24 @@ class QwenSMILESPretrainer:
             metrics_path = self.logs_dir / "pretrain_metrics.csv"
             self.metrics_df.to_csv(metrics_path, index=False)
             logger.info(f"Metrics saved: {metrics_path}")
+
+            validation_metrics_path = self.logs_dir / "pretrain_validation_metrics.csv"
+            pd.DataFrame(self.validation_history).to_csv(validation_metrics_path, index=False)
+            logger.info(f"Validation metrics saved: {validation_metrics_path}")
+
+            summary = {
+                'best_val_loss': self.best_val_loss,
+                'best_val_metrics': self.best_val_metrics,
+                'completed_epochs': len(metrics_history),
+                'completed_steps': self.current_step,
+                'train_csv_paths': self.config['data']['csv_paths'],
+                'metrics_path': str(metrics_path),
+                'validation_metrics_path': str(validation_metrics_path),
+            }
+            summary_path = self.logs_dir / "pretrain_summary.json"
+            with open(summary_path, 'w', encoding='utf-8') as handle:
+                json.dump(_to_serializable(summary), handle, ensure_ascii=False, indent=2)
+            logger.info(f"Summary saved: {summary_path}")
             
             logger.info("="*60)
             logger.info("Training complete")
