@@ -13,11 +13,13 @@ import logging
 import json
 import shutil
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
 import pandas as pd
@@ -38,10 +40,14 @@ from config.pretrain_cli import build_config_from_args, build_parser
 from src.pretrain_utils import compute_token_accuracy_stats, to_serializable
 from src.qwen_utils import copy_qwen_support_files, ensure_required_dependencies
 from src.training_common import (
-    maybe_enable_data_parallel,
+    cleanup_distributed_training,
+    distributed_barrier,
+    is_main_process,
+    maybe_wrap_model_for_multi_gpu,
     resolve_device_config,
     resolve_path,
     set_seed,
+    setup_distributed_training,
     unwrap_data_parallel,
 )
 
@@ -82,6 +88,7 @@ class QwenSMILESPretrainer:
             self.config.get('runtime', {}).get('gpus'),
             logger=logger,
         )
+        self.distributed = setup_distributed_training(self.device, logger=logger)
         self.resume_from = resume_from
         
         logger.info(f"Device: {self.device}")
@@ -125,9 +132,40 @@ class QwenSMILESPretrainer:
         """Return the underlying model when wrapped by DataParallel."""
         return unwrap_data_parallel(self.model)
 
-    def _maybe_enable_data_parallel(self):
+    def _maybe_wrap_model_for_multi_gpu(self):
         """Wrap the model for multi-GPU training when requested."""
-        self.model = maybe_enable_data_parallel(self.model, self.gpu_ids, logger=logger)
+        self.model = maybe_wrap_model_for_multi_gpu(
+            self.model,
+            self.device,
+            self.gpu_ids,
+            distributed=self.distributed,
+            logger=logger,
+        )
+
+    @property
+    def is_main_process(self) -> bool:
+        """Whether this process is responsible for logging and checkpoints."""
+        return is_main_process()
+
+    def _reduce_stats(self, stats: Dict[str, float]) -> Dict[str, float]:
+        """Sum numeric statistics across ranks for distributed evaluation."""
+        if not self.distributed.enabled:
+            return stats
+
+        keys = list(stats.keys())
+        values = torch.tensor(
+            [float(stats[key]) for key in keys],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        reduced = {}
+        for key, value in zip(keys, values.tolist()):
+            if isinstance(stats[key], int):
+                reduced[key] = int(round(value))
+            else:
+                reduced[key] = value
+        return reduced
     
     def setup(self):
         """Initialize tokenizer, data module, and model."""
@@ -156,7 +194,11 @@ class QwenSMILESPretrainer:
         self.data_module.setup()
         
         # Create data loaders
-        self.train_loader, self.val_loader = self.data_module.create_loaders()
+        self.train_loader, self.val_loader = self.data_module.create_loaders(
+            distributed=self.distributed.enabled,
+            world_size=self.distributed.world_size,
+            rank=self.distributed.rank,
+        )
         
         logger.info(f"  Train batches: {len(self.train_loader)}")
         logger.info(f"  Val batches: {len(self.val_loader)}")
@@ -222,10 +264,17 @@ class QwenSMILESPretrainer:
             sys.exit(1)
         
         if self.config['optimization']['gradient_checkpointing']:
-            self.model.gradient_checkpointing_enable()
+            self.model.config.use_cache = False
+            gradient_checkpointing_kwargs = {'use_reentrant': False}
+            try:
+                self.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+                )
+            except TypeError:
+                self.model.gradient_checkpointing_enable()
             logger.info("  Gradient checkpointing enabled")
 
-        self._maybe_enable_data_parallel()
+        self._maybe_wrap_model_for_multi_gpu()
 
         model_dtypes = sorted({str(param.dtype) for param in self.model.parameters()})
         logger.info(f"  Mixed precision mode: {mixed_precision}")
@@ -335,6 +384,10 @@ class QwenSMILESPretrainer:
         
         logger.info(f"\nEpoch {epoch + 1}/{self.config['training']['num_epochs']}")
 
+        train_sampler = getattr(self.train_loader, 'sampler', None)
+        if train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch)
+
         self.optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(tqdm(self.train_loader)):
@@ -344,24 +397,35 @@ class QwenSMILESPretrainer:
                 )
             batch = {k: v.to(self.device) for k, v in batch.items()}
             
-            # Forward pass with mixed precision
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                outputs = self.model(
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    labels=batch['target_ids'],
-                )
-                raw_loss = outputs.loss
+            should_step = (
+                (batch_idx + 1) % gradient_accumulation_steps == 0
+                or (batch_idx + 1) == len(self.train_loader)
+            )
+            sync_context = (
+                self.model.no_sync
+                if self.distributed.enabled and not should_step
+                else nullcontext
+            )
 
-            # Scale loss for gradient accumulation
-            loss = raw_loss / gradient_accumulation_steps
-            
-            # Backward pass
-            if self.use_grad_scaler:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            
+            with sync_context():
+                # Forward pass with mixed precision
+                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch['attention_mask'],
+                        labels=batch['target_ids'],
+                    )
+                    raw_loss = outputs.loss
+
+                # Scale loss for gradient accumulation
+                loss = raw_loss / gradient_accumulation_steps
+
+                # Backward pass
+                if self.use_grad_scaler:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
             # Accumulate metrics
             total_loss += raw_loss.item()
             batch_top1_correct, batch_top5_correct, batch_token_count = compute_token_accuracy_stats(
@@ -373,12 +437,7 @@ class QwenSMILESPretrainer:
             total_top5_correct += batch_top5_correct
             total_tokens += batch_token_count
             total_sequences += batch['input_ids'].size(0)
-            
-            # Update weights every accumulation step
-            should_step = (
-                (batch_idx + 1) % gradient_accumulation_steps == 0
-                or (batch_idx + 1) == len(self.train_loader)
-            )
+
             if should_step:
                 # Clip gradients
                 if self.use_grad_scaler:
@@ -400,7 +459,7 @@ class QwenSMILESPretrainer:
                 self.current_step += 1
 
                 # Logging / validation / checkpoint are step-based so they only fire once.
-                if self.current_step % logging_steps == 0:
+                if self.current_step % logging_steps == 0 and self.is_main_process:
                     avg_loss = total_loss / (batch_idx + 1)
                     perplexity = np.exp(avg_loss)
                     logger.info(
@@ -420,13 +479,24 @@ class QwenSMILESPretrainer:
                             **val_metrics,
                         }
                         self.save_checkpoint(is_best=True)
-                        logger.info(f"New best validation loss: {val_metrics['val_loss']:.4f}")
+                        if self.is_main_process:
+                            logger.info(f"New best validation loss: {val_metrics['val_loss']:.4f}")
 
                 if self.current_step % self.config['training']['save_steps'] == 0:
                     self.save_checkpoint()
         
         # Epoch metrics
-        epoch_loss = total_loss / len(self.train_loader)
+        reduced_stats = self._reduce_stats(
+            {
+                'total_loss': total_loss,
+                'total_top1_correct': total_top1_correct,
+                'total_top5_correct': total_top5_correct,
+                'total_tokens': total_tokens,
+                'total_sequences': total_sequences,
+                'num_batches': len(self.train_loader),
+            }
+        )
+        epoch_loss = reduced_stats['total_loss'] / reduced_stats['num_batches']
         epoch_perplexity = np.exp(epoch_loss)
         
         return {
@@ -434,13 +504,17 @@ class QwenSMILESPretrainer:
             'train_loss': epoch_loss,
             'train_perplexity': epoch_perplexity,
             'train_token_accuracy': (
-                total_top1_correct / total_tokens if total_tokens else float('nan')
+                reduced_stats['total_top1_correct'] / reduced_stats['total_tokens']
+                if reduced_stats['total_tokens']
+                else float('nan')
             ),
             'train_top5_token_accuracy': (
-                total_top5_correct / total_tokens if total_tokens else float('nan')
+                reduced_stats['total_top5_correct'] / reduced_stats['total_tokens']
+                if reduced_stats['total_tokens']
+                else float('nan')
             ),
-            'train_token_count': total_tokens,
-            'train_sequence_count': total_sequences,
+            'train_token_count': reduced_stats['total_tokens'],
+            'train_sequence_count': reduced_stats['total_sequences'],
             'learning_rate': self.optimizer.param_groups[0]['lr'],
             'optimizer_steps': self.current_step,
         }
@@ -487,28 +561,49 @@ class QwenSMILESPretrainer:
             total_top5_correct += batch_top5_correct
             total_tokens += batch_token_count
         
-        avg_val_loss = total_loss / total_samples if total_samples else float('nan')
-        val_perplexity = np.exp(avg_val_loss) if total_samples else float('nan')
+        reduced_stats = self._reduce_stats(
+            {
+                'total_loss': total_loss,
+                'total_samples': total_samples,
+                'total_top1_correct': total_top1_correct,
+                'total_top5_correct': total_top5_correct,
+                'total_tokens': total_tokens,
+            }
+        )
+
+        avg_val_loss = (
+            reduced_stats['total_loss'] / reduced_stats['total_samples']
+            if reduced_stats['total_samples']
+            else float('nan')
+        )
+        val_perplexity = (
+            np.exp(avg_val_loss) if reduced_stats['total_samples'] else float('nan')
+        )
         val_metrics = {
             'val_loss': avg_val_loss,
             'val_perplexity': val_perplexity,
             'val_token_accuracy': (
-                total_top1_correct / total_tokens if total_tokens else float('nan')
+                reduced_stats['total_top1_correct'] / reduced_stats['total_tokens']
+                if reduced_stats['total_tokens']
+                else float('nan')
             ),
             'val_top5_token_accuracy': (
-                total_top5_correct / total_tokens if total_tokens else float('nan')
+                reduced_stats['total_top5_correct'] / reduced_stats['total_tokens']
+                if reduced_stats['total_tokens']
+                else float('nan')
             ),
-            'val_token_count': total_tokens,
-            'val_sequence_count': total_samples,
+            'val_token_count': reduced_stats['total_tokens'],
+            'val_sequence_count': reduced_stats['total_samples'],
         }
         
-        logger.info(
-            "  Validation | Loss: %.4f | Perplexity: %.4f | Token Acc: %.4f | Top5 Acc: %.4f",
-            val_metrics['val_loss'],
-            val_metrics['val_perplexity'],
-            val_metrics['val_token_accuracy'],
-            val_metrics['val_top5_token_accuracy'],
-        )
+        if self.is_main_process:
+            logger.info(
+                "  Validation | Loss: %.4f | Perplexity: %.4f | Token Acc: %.4f | Top5 Acc: %.4f",
+                val_metrics['val_loss'],
+                val_metrics['val_perplexity'],
+                val_metrics['val_token_accuracy'],
+                val_metrics['val_top5_token_accuracy'],
+            )
 
         if record_history:
             self.validation_history.append(
@@ -524,6 +619,10 @@ class QwenSMILESPretrainer:
     
     def save_checkpoint(self, is_best: bool = False):
         """Save model checkpoint."""
+        if not self.is_main_process:
+            distributed_barrier()
+            return
+
         save_dir = self.output_dir / f"checkpoint-{self.current_step}"
         save_dir.mkdir(parents=True, exist_ok=True)
         
@@ -553,6 +652,7 @@ class QwenSMILESPretrainer:
                 shutil.rmtree(best_dir)
             shutil.copytree(save_dir, best_dir)
             logger.info(f"Best model updated: {best_dir}")
+        distributed_barrier()
 
     def _copy_qwen_support_files(self, target_dir: Path):
         """Copy trust_remote_code support files so local checkpoints are reloadable."""
@@ -590,56 +690,61 @@ class QwenSMILESPretrainer:
                     self.save_checkpoint(is_best=True)
                 
                 # Log epoch summary
-                logger.info(f"\nEpoch {epoch + 1} Summary:")
-                logger.info(f"  Train Loss: {epoch_metrics['train_loss']:.4f}")
-                logger.info(f"  Train Perplexity: {epoch_metrics['train_perplexity']:.4f}")
-                logger.info(f"  Train Token Acc: {epoch_metrics['train_token_accuracy']:.4f}")
-                logger.info(f"  Val Loss: {epoch_metrics['val_loss']:.4f}")
-                logger.info(f"  Val Perplexity: {epoch_metrics['val_perplexity']:.4f}")
-                logger.info(f"  Val Token Acc: {epoch_metrics['val_token_accuracy']:.4f}")
-                logger.info(f"  Val Top5 Token Acc: {epoch_metrics['val_top5_token_accuracy']:.4f}")
+                if self.is_main_process:
+                    logger.info(f"\nEpoch {epoch + 1} Summary:")
+                    logger.info(f"  Train Loss: {epoch_metrics['train_loss']:.4f}")
+                    logger.info(f"  Train Perplexity: {epoch_metrics['train_perplexity']:.4f}")
+                    logger.info(f"  Train Token Acc: {epoch_metrics['train_token_accuracy']:.4f}")
+                    logger.info(f"  Val Loss: {epoch_metrics['val_loss']:.4f}")
+                    logger.info(f"  Val Perplexity: {epoch_metrics['val_perplexity']:.4f}")
+                    logger.info(f"  Val Token Acc: {epoch_metrics['val_token_accuracy']:.4f}")
+                    logger.info(f"  Val Top5 Token Acc: {epoch_metrics['val_top5_token_accuracy']:.4f}")
         
         except KeyboardInterrupt:
-            logger.info("Training interrupted by user")
+            if self.is_main_process:
+                logger.info("Training interrupted by user")
         
         finally:
-            # Save final model
-            final_dir = self.output_dir / "final_model"
-            if final_dir.exists():
-                shutil.rmtree(final_dir)
-            self._unwrap_model().save_pretrained(str(final_dir))
-            self._copy_qwen_support_files(final_dir)
-            if self.tokenizer is not None:
-                self.tokenizer.save(str(final_dir / "tokenizer.json"))
-            logger.info(f"Final model saved: {final_dir}")
-            
-            # Save metrics
-            self.metrics_df = pd.DataFrame(metrics_history)
-            metrics_path = self.logs_dir / "pretrain_metrics.csv"
-            self.metrics_df.to_csv(metrics_path, index=False)
-            logger.info(f"Metrics saved: {metrics_path}")
+            if self.is_main_process:
+                # Save final model
+                final_dir = self.output_dir / "final_model"
+                if final_dir.exists():
+                    shutil.rmtree(final_dir)
+                self._unwrap_model().save_pretrained(str(final_dir))
+                self._copy_qwen_support_files(final_dir)
+                if self.tokenizer is not None:
+                    self.tokenizer.save(str(final_dir / "tokenizer.json"))
+                logger.info(f"Final model saved: {final_dir}")
 
-            validation_metrics_path = self.logs_dir / "pretrain_validation_metrics.csv"
-            pd.DataFrame(self.validation_history).to_csv(validation_metrics_path, index=False)
-            logger.info(f"Validation metrics saved: {validation_metrics_path}")
+                # Save metrics
+                self.metrics_df = pd.DataFrame(metrics_history)
+                metrics_path = self.logs_dir / "pretrain_metrics.csv"
+                self.metrics_df.to_csv(metrics_path, index=False)
+                logger.info(f"Metrics saved: {metrics_path}")
 
-            summary = {
-                'best_val_loss': self.best_val_loss,
-                'best_val_metrics': self.best_val_metrics,
-                'completed_epochs': len(metrics_history),
-                'completed_steps': self.current_step,
-                'train_csv_paths': self.config['data']['csv_paths'],
-                'metrics_path': str(metrics_path),
-                'validation_metrics_path': str(validation_metrics_path),
-            }
-            summary_path = self.logs_dir / "pretrain_summary.json"
-            with open(summary_path, 'w', encoding='utf-8') as handle:
-                json.dump(to_serializable(summary), handle, ensure_ascii=False, indent=2)
-            logger.info(f"Summary saved: {summary_path}")
-            
-            logger.info("="*60)
-            logger.info("Training complete")
-            logger.info("="*60)
+                validation_metrics_path = self.logs_dir / "pretrain_validation_metrics.csv"
+                pd.DataFrame(self.validation_history).to_csv(validation_metrics_path, index=False)
+                logger.info(f"Validation metrics saved: {validation_metrics_path}")
+
+                summary = {
+                    'best_val_loss': self.best_val_loss,
+                    'best_val_metrics': self.best_val_metrics,
+                    'completed_epochs': len(metrics_history),
+                    'completed_steps': self.current_step,
+                    'train_csv_paths': self.config['data']['csv_paths'],
+                    'metrics_path': str(metrics_path),
+                    'validation_metrics_path': str(validation_metrics_path),
+                }
+                summary_path = self.logs_dir / "pretrain_summary.json"
+                with open(summary_path, 'w', encoding='utf-8') as handle:
+                    json.dump(to_serializable(summary), handle, ensure_ascii=False, indent=2)
+                logger.info(f"Summary saved: {summary_path}")
+
+                logger.info("="*60)
+                logger.info("Training complete")
+                logger.info("="*60)
+            distributed_barrier()
+            cleanup_distributed_training()
 
 
 def main():

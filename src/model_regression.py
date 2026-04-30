@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -560,15 +561,31 @@ class RegressionDataModule:
         else:
             self._setup_from_manual_csv(smiles_list, labels)
     
-    def create_loaders(self):
+    def create_loaders(
+        self,
+        distributed: bool = False,
+        world_size: int = 1,
+        rank: int = 0,
+    ):
         """Create DataLoaders."""
         if self.train_dataset is None:
             self.setup()
+
+        train_sampler = None
+        if distributed:
+            train_sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=False,
+            )
         
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             pin_memory=torch.cuda.is_available(),
         )
         

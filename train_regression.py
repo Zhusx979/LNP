@@ -14,6 +14,7 @@ This script will:
 
 import logging
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Tuple
 import json
@@ -42,10 +43,14 @@ from src.regression_utils import (
     to_builtin,
 )
 from src.training_common import (
-    maybe_enable_data_parallel,
+    cleanup_distributed_training,
+    distributed_barrier,
+    is_main_process,
+    maybe_wrap_model_for_multi_gpu,
     resolve_device_config,
     resolve_path,
     set_seed,
+    setup_distributed_training,
     unwrap_data_parallel,
 )
 
@@ -119,6 +124,7 @@ class QwenRegressionTrainer:
             self.runtime_config.get('gpus'),
             logger=logger,
         )
+        self.distributed = setup_distributed_training(self.device, logger=logger)
         logger.info(f"Device: {self.device}")
         logger.info(f"CUDA available: {torch.cuda.is_available()}")
         logger.info(f"GPU ids: {self.gpu_ids if self.gpu_ids else 'CPU only'}")
@@ -179,9 +185,20 @@ class QwenRegressionTrainer:
         """Return the underlying model when wrapped by DataParallel."""
         return unwrap_data_parallel(self.model)
 
-    def _maybe_enable_data_parallel(self):
+    def _maybe_wrap_model_for_multi_gpu(self):
         """Wrap the model for multi-GPU training when requested."""
-        self.model = maybe_enable_data_parallel(self.model, self.gpu_ids, logger=logger)
+        self.model = maybe_wrap_model_for_multi_gpu(
+            self.model,
+            self.device,
+            self.gpu_ids,
+            distributed=self.distributed,
+            logger=logger,
+        )
+
+    @property
+    def is_main_process(self) -> bool:
+        """Whether this process is responsible for logging and artifacts."""
+        return is_main_process()
     
     @staticmethod
     def _validate_inputs(pretrained_path: Path, tokenizer_path: Path):
@@ -256,7 +273,7 @@ class QwenRegressionTrainer:
         self.model = QwenRegressionModel(base_model)
         self.model = self.model.to(self.device, dtype=dtype)
         self._configure_trainable_parameters()
-        self._maybe_enable_data_parallel()
+        self._maybe_wrap_model_for_multi_gpu()
         logger.info(f"  Mixed precision mode: {mixed_precision}")
         logger.info(f"  AMP enabled: {self.use_amp}")
         logger.info(f"  GradScaler enabled: {self.use_grad_scaler}")
@@ -266,7 +283,11 @@ class QwenRegressionTrainer:
         # Load data
         logger.info("[3/3] Loading regression dataset...")
         data_module.setup()
-        self.train_loader, self.val_loader, self.test_loader = data_module.create_loaders()
+        self.train_loader, self.val_loader, self.test_loader = data_module.create_loaders(
+            distributed=self.distributed.enabled,
+            world_size=self.distributed.world_size,
+            rank=self.distributed.rank,
+        )
         
         logger.info(f"  Train batches: {len(self.train_loader)}")
         logger.info(f"  Val batches: {len(self.val_loader)}")
@@ -322,124 +343,129 @@ class QwenRegressionTrainer:
             for epoch in range(self.training_config['num_epochs']):
                 # Training
                 train_loss = self._train_epoch(epoch, optimizer, criterion, scaler)
-                
-                # Validation
-                val_metrics, _ = self._evaluate_loader(
+                if self.is_main_process:
+                    # Validation
+                    val_metrics, _ = self._evaluate_loader(
+                        self.val_loader,
+                        criterion,
+                        split_name='val',
+                        save_predictions=False,
+                    )
+                    val_loss = val_metrics['loss']
+                    val_rmse = val_metrics['rmse']
+                    val_mae = val_metrics['mae']
+
+                    logger.info(f"Epoch {epoch+1}/{self.training_config['num_epochs']}")
+                    logger.info(f"  Train Loss: {train_loss:.4f}")
+                    logger.info(f"  Val Loss: {val_loss:.4f}")
+                    logger.info(f"  Val RMSE: {val_rmse:.4f}")
+                    logger.info(f"  Val MAE: {val_mae:.4f}")
+                    logger.info(f"  Val R2: {val_metrics['r2']:.4f}")
+                    logger.info(f"  Val Pearson: {val_metrics['pearson_r']:.4f}")
+                    logger.info(f"  Val Spearman: {val_metrics['spearman_r']:.4f}")
+
+                    # Save best model
+                    if np.isfinite(val_rmse) and val_rmse < self.best_val_rmse:
+                        self.best_val_rmse = val_rmse
+                        self._save_model(is_best=True)
+                        self.best_epoch = epoch + 1
+                        self.best_model_metrics = dict(val_metrics)
+                        logger.info(f"New best RMSE: {val_rmse:.4f}")
+
+                    self.metrics_history.append({
+                        'epoch': epoch + 1,
+                        'train_loss': train_loss,
+                        **val_metrics,
+                    })
+                distributed_barrier()
+        
+        except KeyboardInterrupt:
+            if self.is_main_process:
+                logger.info("Training interrupted")
+        
+        finally:
+            if self.is_main_process:
+                # Save final model and metrics
+                self._save_model(is_best=False)
+
+                metrics_df = pd.DataFrame(self.metrics_history)
+                metrics_path = self._artifact_path('regression_metrics', '.csv')
+                metrics_df.to_csv(metrics_path, index=False)
+                logger.info(f"Metrics saved: {metrics_path}")
+
+                final_val_metrics, final_val_predictions = self._evaluate_saved_model(
+                    'final_model',
                     self.val_loader,
                     criterion,
                     split_name='val',
-                    save_predictions=False,
                 )
-                val_loss = val_metrics['loss']
-                val_rmse = val_metrics['rmse']
-                val_mae = val_metrics['mae']
-                
-                logger.info(f"Epoch {epoch+1}/{self.training_config['num_epochs']}")
-                logger.info(f"  Train Loss: {train_loss:.4f}")
-                logger.info(f"  Val Loss: {val_loss:.4f}")
-                logger.info(f"  Val RMSE: {val_rmse:.4f}")
-                logger.info(f"  Val MAE: {val_mae:.4f}")
-                logger.info(f"  Val R2: {val_metrics['r2']:.4f}")
-                logger.info(f"  Val Pearson: {val_metrics['pearson_r']:.4f}")
-                logger.info(f"  Val Spearman: {val_metrics['spearman_r']:.4f}")
-                
-                # Save best model
-                if np.isfinite(val_rmse) and val_rmse < self.best_val_rmse:
-                    self.best_val_rmse = val_rmse
-                    self._save_model(is_best=True)
-                    self.best_epoch = epoch + 1
-                    self.best_model_metrics = dict(val_metrics)
-                    logger.info(f"New best RMSE: {val_rmse:.4f}")
-                
-                self.metrics_history.append({
-                    'epoch': epoch + 1,
-                    'train_loss': train_loss,
-                    **val_metrics,
-                })
-        
-        except KeyboardInterrupt:
-            logger.info("Training interrupted")
-        
-        finally:
-            # Save final model and metrics
-            self._save_model(is_best=False)
-            
-            metrics_df = pd.DataFrame(self.metrics_history)
-            metrics_path = self._artifact_path('regression_metrics', '.csv')
-            metrics_df.to_csv(metrics_path, index=False)
-            logger.info(f"Metrics saved: {metrics_path}")
+                final_test_metrics, final_test_predictions = self._evaluate_saved_model(
+                    'final_model',
+                    self.test_loader,
+                    criterion,
+                    split_name='test',
+                )
+                best_val_metrics, best_val_predictions = self._evaluate_saved_model(
+                    'best_model',
+                    self.val_loader,
+                    criterion,
+                    split_name='val',
+                )
+                best_test_metrics, best_test_predictions = self._evaluate_saved_model(
+                    'best_model',
+                    self.test_loader,
+                    criterion,
+                    split_name='test',
+                )
 
-            final_val_metrics, final_val_predictions = self._evaluate_saved_model(
-                'final_model',
-                self.val_loader,
-                criterion,
-                split_name='val',
-            )
-            final_test_metrics, final_test_predictions = self._evaluate_saved_model(
-                'final_model',
-                self.test_loader,
-                criterion,
-                split_name='test',
-            )
-            best_val_metrics, best_val_predictions = self._evaluate_saved_model(
-                'best_model',
-                self.val_loader,
-                criterion,
-                split_name='val',
-            )
-            best_test_metrics, best_test_predictions = self._evaluate_saved_model(
-                'best_model',
-                self.test_loader,
-                criterion,
-                split_name='test',
-            )
+                summary = {
+                    'dataset_name': self.dataset_name,
+                    'output_dir': str(self.output_dir),
+                    'logs_dir': str(self.logs_dir),
+                    'best_epoch': self.best_epoch,
+                    'best_val_rmse': self.best_val_rmse,
+                    'loaded_csv_files': getattr(self.data_module, 'loaded_csv_files', []),
+                    'split_sizes': {
+                        'train': len(self.train_loader.dataset) if self.train_loader is not None else 0,
+                        'val': len(self.val_loader.dataset) if self.val_loader is not None else 0,
+                        'test': len(self.test_loader.dataset) if self.test_loader is not None else 0,
+                    },
+                    'best_model_validation': best_val_metrics,
+                    'best_model_test': best_test_metrics,
+                    'final_model_validation': final_val_metrics,
+                    'final_model_test': final_test_metrics,
+                }
+                summary_path = self._artifact_path('regression_summary', '.json')
+                with open(summary_path, 'w', encoding='utf-8') as handle:
+                    json.dump(self._json_ready_dict(summary), handle, ensure_ascii=False, indent=2)
+                logger.info(f"Summary saved: {summary_path}")
 
-            summary = {
-                'dataset_name': self.dataset_name,
-                'output_dir': str(self.output_dir),
-                'logs_dir': str(self.logs_dir),
-                'best_epoch': self.best_epoch,
-                'best_val_rmse': self.best_val_rmse,
-                'loaded_csv_files': getattr(self.data_module, 'loaded_csv_files', []),
-                'split_sizes': {
-                    'train': len(self.train_loader.dataset) if self.train_loader is not None else 0,
-                    'val': len(self.val_loader.dataset) if self.val_loader is not None else 0,
-                    'test': len(self.test_loader.dataset) if self.test_loader is not None else 0,
-                },
-                'best_model_validation': best_val_metrics,
-                'best_model_test': best_test_metrics,
-                'final_model_validation': final_val_metrics,
-                'final_model_test': final_test_metrics,
-            }
-            summary_path = self._artifact_path('regression_summary', '.json')
-            with open(summary_path, 'w', encoding='utf-8') as handle:
-                json.dump(self._json_ready_dict(summary), handle, ensure_ascii=False, indent=2)
-            logger.info(f"Summary saved: {summary_path}")
+                if final_val_predictions is not None:
+                    final_val_predictions.to_csv(
+                        self._artifact_path('final_model_val_predictions', '.csv'),
+                        index=False,
+                    )
+                if final_test_predictions is not None:
+                    final_test_predictions.to_csv(
+                        self._artifact_path('final_model_test_predictions', '.csv'),
+                        index=False,
+                    )
+                if best_val_predictions is not None:
+                    best_val_predictions.to_csv(
+                        self._artifact_path('best_model_val_predictions', '.csv'),
+                        index=False,
+                    )
+                if best_test_predictions is not None:
+                    best_test_predictions.to_csv(
+                        self._artifact_path('best_model_test_predictions', '.csv'),
+                        index=False,
+                    )
 
-            if final_val_predictions is not None:
-                final_val_predictions.to_csv(
-                    self._artifact_path('final_model_val_predictions', '.csv'),
-                    index=False,
-                )
-            if final_test_predictions is not None:
-                final_test_predictions.to_csv(
-                    self._artifact_path('final_model_test_predictions', '.csv'),
-                    index=False,
-                )
-            if best_val_predictions is not None:
-                best_val_predictions.to_csv(
-                    self._artifact_path('best_model_val_predictions', '.csv'),
-                    index=False,
-                )
-            if best_test_predictions is not None:
-                best_test_predictions.to_csv(
-                    self._artifact_path('best_model_test_predictions', '.csv'),
-                    index=False,
-                )
-            
-            logger.info("="*60)
-            logger.info("Training complete")
-            logger.info("="*60)
+                logger.info("="*60)
+                logger.info("Training complete")
+                logger.info("="*60)
+            distributed_barrier()
+            cleanup_distributed_training()
     
     def _train_epoch(self, epoch: int, optimizer, criterion, scaler):
         """Train one epoch."""
@@ -448,6 +474,9 @@ class QwenRegressionTrainer:
         total_loss = 0.0
         gradient_accumulation_steps = int(self.training_config['gradient_accumulation_steps'])
         optimizer.zero_grad(set_to_none=True)
+        train_sampler = getattr(self.train_loader, 'sampler', None)
+        if train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch)
 
         for batch_idx, batch in tqdm(
             enumerate(self.train_loader),
@@ -457,24 +486,30 @@ class QwenRegressionTrainer:
             batch = {k: v.to(self.device) for k, v in batch.items()}
             labels = batch.pop('label').view(-1)
             
-            # Forward pass
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                predictions = self.model(**batch).view(-1)
-                raw_loss = criterion(predictions, labels)
-            loss = raw_loss / gradient_accumulation_steps
-            # Accumulate metrics
-            total_loss += raw_loss.item()
-
-            # Backward pass
-            if self.use_grad_scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
             should_step = (
                 (batch_idx + 1) % gradient_accumulation_steps == 0
                 or (batch_idx + 1) == len(self.train_loader)
             )
+            sync_context = (
+                self.model.no_sync
+                if self.distributed.enabled and not should_step
+                else nullcontext
+            )
+            with sync_context():
+                # Forward pass
+                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                    predictions = self.model(**batch).view(-1)
+                    raw_loss = criterion(predictions, labels)
+                loss = raw_loss / gradient_accumulation_steps
+                # Backward pass
+                if self.use_grad_scaler:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            # Accumulate metrics
+            total_loss += raw_loss.item()
+
             if should_step:
                 if self.use_grad_scaler:
                     scaler.unscale_(optimizer)
@@ -489,8 +524,17 @@ class QwenRegressionTrainer:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-        
-        return total_loss / len(self.train_loader)
+
+        total_loss_tensor = torch.tensor(total_loss, device=self.device, dtype=torch.float64)
+        if self.distributed.enabled:
+            torch.distributed.all_reduce(total_loss_tensor, op=torch.distributed.ReduceOp.SUM)
+            mean_loss = total_loss_tensor.item() / (
+                len(self.train_loader) * self.distributed.world_size
+            )
+        else:
+            mean_loss = total_loss / len(self.train_loader)
+
+        return mean_loss
     
     @torch.no_grad()
     def _evaluate_loader(

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from .tokenizer import SMILESTokenizer
 
@@ -247,15 +248,39 @@ class SMILESDataModule:
             self.max_length,
         )
     
-    def create_loaders(self):
+    def create_loaders(
+        self,
+        distributed: bool = False,
+        world_size: int = 1,
+        rank: int = 0,
+    ):
         """Create PyTorch DataLoaders."""
         if self.train_dataset is None:
             self.setup()
+
+        train_sampler = None
+        val_sampler = None
+        if distributed:
+            train_sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=self.shuffle,
+                drop_last=False,
+            )
+            val_sampler = DistributedSampler(
+                self.val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=False,
+            )
         
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=self.shuffle,
+            shuffle=self.shuffle if train_sampler is None else False,
+            sampler=train_sampler,
             num_workers=self.num_workers,
             pin_memory=True,
         )
@@ -264,6 +289,7 @@ class SMILESDataModule:
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=self.num_workers,
             pin_memory=True,
         )
