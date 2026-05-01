@@ -62,7 +62,7 @@ Python packages are pinned in `requirements.txt` and currently include:
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Zhusx979/LNP.git
 cd virtual_LNP
 ```
 
