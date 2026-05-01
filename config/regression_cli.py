@@ -24,6 +24,9 @@ def build_config_from_args(args: argparse.Namespace) -> Dict:
         "data": {
             "csv_path": args.csv,
             "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "validation_split": args.validation_split,
+            "test_split": args.test_split,
             "auto_discover_agile": not args.no_auto_discover,
             "agile_cell_line": args.agile_cell_line,
             "agile_split": args.agile_split,
@@ -130,6 +133,26 @@ Examples:
         type=int,
         default=1,
         help="Batch size",
+    )
+    parser.add_argument(
+        "--num-workers",
+        "--num_workers",
+        dest="num_workers",
+        type=int,
+        default=0,
+        help="Number of DataLoader worker processes",
+    )
+    parser.add_argument(
+        "--validation-split",
+        type=float,
+        default=0.2,
+        help="Validation split ratio",
+    )
+    parser.add_argument(
+        "--test-split",
+        type=float,
+        default=0.1,
+        help="Test split ratio for manual CSV datasets",
     )
     parser.add_argument(
         "--learning-rate",

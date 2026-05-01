@@ -186,6 +186,7 @@ class RegressionDataModule:
         tokenizer=None,
         max_length: int = 256,
         batch_size: int = 32,
+        num_workers: int = 0,
         validation_split: float = 0.2,
         test_split: float = 0.1,
         normalize_labels: bool = True,
@@ -202,6 +203,7 @@ class RegressionDataModule:
             tokenizer: SMILES tokenizer
             max_length: Max sequence length
             batch_size: Batch size
+            num_workers: DataLoader worker process count
             validation_split: Validation set fraction
             test_split: Test set fraction
             normalize_labels: Normalize regression targets
@@ -214,6 +216,7 @@ class RegressionDataModule:
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.batch_size = batch_size
+        self.num_workers = num_workers
         self.validation_split = validation_split
         self.test_split = test_split
         self.normalize_labels = normalize_labels
@@ -599,6 +602,7 @@ class RegressionDataModule:
             batch_size=self.batch_size,
             shuffle=train_sampler is None,
             sampler=train_sampler,
+            num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
         )
         
@@ -606,6 +610,7 @@ class RegressionDataModule:
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
+            num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
         )
         
@@ -613,6 +618,7 @@ class RegressionDataModule:
             self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
+            num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
         )
         
