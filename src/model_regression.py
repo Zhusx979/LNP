@@ -24,7 +24,7 @@ class QwenRegressionModel(nn.Module):
     - Linear regression head (hidden_dim �� 1)
     """
     
-    def __init__(self, model, hidden_size: int = 2048, dropout: float = 0.1):
+    def __init__(self, model, hidden_size: Optional[int] = None, dropout: float = 0.1):
         """
         Initialize regression model.
         
@@ -35,12 +35,14 @@ class QwenRegressionModel(nn.Module):
         """
         super().__init__()
         self.model = model
-        self.hidden_size = hidden_size
+        config_hidden_size = getattr(getattr(model, "config", None), "hidden_size", None)
+        config_hidden_size = config_hidden_size or getattr(getattr(model, "config", None), "n_embd", None)
+        self.hidden_size = hidden_size or config_hidden_size or 2048
         
         # Regression head
         self.head = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, 256),
+            nn.Linear(self.hidden_size, 256),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(256, 1),  # Output: continuous value
@@ -61,18 +63,29 @@ class QwenRegressionModel(nn.Module):
         Returns:
             Regression predictions [batch_size, 1]
         """
-        # Get hidden states from Qwen
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        
-        # Use mean pooling over non-padding tokens
-        hidden_states = outputs.hidden_states[-1]  # Last layer
+        # Query the transformer backbone directly so regression does not allocate
+        # LM logits, per-layer hidden states, or generation caches.
+        transformer = getattr(self.model, "transformer", None)
+        if transformer is not None:
+            outputs = transformer(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            hidden_states = outputs.last_hidden_state
+        else:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            hidden_states = outputs.hidden_states[-1]
         
         # Apply attention mask and compute mean
-        mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size())
+        mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).type_as(hidden_states)
         masked_hidden = hidden_states * mask_expanded
         sum_hidden = masked_hidden.sum(dim=1)
         sum_mask = mask_expanded.sum(dim=1)

@@ -20,9 +20,10 @@ from typing import Dict, Tuple
 import json
 from tqdm import tqdm
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 import numpy as np
 import pandas as pd
 
@@ -157,6 +158,25 @@ class QwenRegressionTrainer:
     def _artifact_path(self, stem: str, suffix: str) -> Path:
         """Build a dataset-scoped artifact path inside the logs directory."""
         return self.logs_dir / f"{stem}_{self.dataset_name}{suffix}"
+
+    def _autocast_context(self):
+        """Use the non-deprecated autocast API when CUDA AMP is enabled."""
+        if not self.use_amp or self.amp_dtype is None or self.device.type != "cuda":
+            return nullcontext()
+        return torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype)
+
+    def _gather_across_ranks(self, values):
+        """Gather Python objects from all ranks when running with DDP."""
+        if not self.distributed.enabled:
+            return values
+
+        gathered = [None] * self.distributed.world_size
+        dist.all_gather_object(gathered, values)
+        merged = []
+        for shard in gathered:
+            if shard:
+                merged.extend(shard)
+        return merged
 
     @staticmethod
     def _safe_correlation(fn, y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
@@ -338,19 +358,19 @@ class QwenRegressionTrainer:
 
         criterion = nn.MSELoss()
         scaler = GradScaler(enabled=self.use_grad_scaler)
+        training_failed = False
         
         try:
             for epoch in range(self.training_config['num_epochs']):
                 # Training
                 train_loss = self._train_epoch(epoch, optimizer, criterion, scaler)
+                val_metrics, _ = self._evaluate_loader(
+                    self.val_loader,
+                    criterion,
+                    split_name='val',
+                    save_predictions=False,
+                )
                 if self.is_main_process:
-                    # Validation
-                    val_metrics, _ = self._evaluate_loader(
-                        self.val_loader,
-                        criterion,
-                        split_name='val',
-                        save_predictions=False,
-                    )
                     val_loss = val_metrics['loss']
                     val_rmse = val_metrics['rmse']
                     val_mae = val_metrics['mae']
@@ -382,6 +402,9 @@ class QwenRegressionTrainer:
         except KeyboardInterrupt:
             if self.is_main_process:
                 logger.info("Training interrupted")
+        except Exception:
+            training_failed = True
+            raise
         
         finally:
             if self.is_main_process:
@@ -393,6 +416,19 @@ class QwenRegressionTrainer:
                 metrics_df.to_csv(metrics_path, index=False)
                 logger.info(f"Metrics saved: {metrics_path}")
 
+            distributed_barrier()
+
+            final_val_metrics = final_val_predictions = None
+            final_test_metrics = final_test_predictions = None
+            best_val_metrics = best_val_predictions = None
+            best_test_metrics = best_test_predictions = None
+
+            if training_failed:
+                if self.is_main_process:
+                    logger.warning(
+                        "Skipping saved-model evaluation because training exited with an error."
+                    )
+            else:
                 final_val_metrics, final_val_predictions = self._evaluate_saved_model(
                     'final_model',
                     self.val_loader,
@@ -418,6 +454,7 @@ class QwenRegressionTrainer:
                     split_name='test',
                 )
 
+            if self.is_main_process:
                 summary = {
                     'dataset_name': self.dataset_name,
                     'output_dir': str(self.output_dir),
@@ -434,6 +471,7 @@ class QwenRegressionTrainer:
                     'best_model_test': best_test_metrics,
                     'final_model_validation': final_val_metrics,
                     'final_model_test': final_test_metrics,
+                    'training_failed': training_failed,
                 }
                 summary_path = self._artifact_path('regression_summary', '.json')
                 with open(summary_path, 'w', encoding='utf-8') as handle:
@@ -497,7 +535,7 @@ class QwenRegressionTrainer:
             )
             with sync_context():
                 # Forward pass
-                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                with self._autocast_context():
                     predictions = self.model(**batch).view(-1)
                     raw_loss = criterion(predictions, labels)
                 loss = raw_loss / gradient_accumulation_steps
@@ -546,35 +584,53 @@ class QwenRegressionTrainer:
     ):
         """Run evaluation on one split and optionally collect predictions."""
         self.model.eval()
-        total_loss = 0.0
         all_preds = []
         all_labels = []
         all_smiles = []
-        total_samples = 0
 
         if loader is None:
             return {'split': split_name, 'loss': float('nan'), 'num_samples': 0}, None
+
+        dataset = getattr(loader, 'dataset', None)
+        local_smiles = []
+        if save_predictions and dataset is not None and hasattr(dataset, 'smiles_list'):
+            sampler = getattr(loader, 'sampler', None)
+            if sampler is not None:
+                local_indices = list(iter(sampler))
+            else:
+                local_indices = list(range(len(dataset)))
+            local_smiles = [dataset.smiles_list[idx] for idx in local_indices]
         
         for batch in loader:
             batch = {k: v.to(self.device) for k, v in batch.items()}
             labels = batch.pop('label').view(-1)
             
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with self._autocast_context():
                 predictions = self.model(**batch).view(-1)
                 loss = criterion(predictions, labels)
             
-            batch_size = labels.shape[0]
-            total_loss += loss.item() * batch_size
-            total_samples += batch_size
             all_preds.extend(predictions.detach().cpu().tolist())
             all_labels.extend(labels.detach().cpu().tolist())
-        
-        dataset = getattr(loader, 'dataset', None)
-        if save_predictions and dataset is not None and hasattr(dataset, 'smiles_list'):
-            all_smiles = list(dataset.smiles_list)
-        
+
+        all_preds = self._gather_across_ranks(all_preds)
+        all_labels = self._gather_across_ranks(all_labels)
+        if save_predictions:
+            all_smiles = self._gather_across_ranks(local_smiles)
+
+        if dataset is not None:
+            dataset_size = len(dataset)
+            all_preds = all_preds[:dataset_size]
+            all_labels = all_labels[:dataset_size]
+            if save_predictions:
+                all_smiles = all_smiles[:dataset_size]
+
         all_preds = np.array(all_preds, dtype=float)
         all_labels = np.array(all_labels, dtype=float)
+        eval_loss = (
+            float(np.mean(np.square(all_preds - all_labels)))
+            if len(all_labels)
+            else float('nan')
+        )
         label_scaler = getattr(loader.dataset, "label_scaler", None)
         if label_scaler is not None:
             all_preds = label_scaler.inverse_transform(all_preds.reshape(-1, 1)).flatten()
@@ -582,7 +638,7 @@ class QwenRegressionTrainer:
 
         metrics = self._compute_regression_metrics(all_labels, all_preds)
         metrics['split'] = split_name
-        metrics['loss'] = float(total_loss / total_samples) if total_samples else float('nan')
+        metrics['loss'] = eval_loss
         metrics['num_samples'] = int(len(all_labels))
 
         predictions_df = None
@@ -606,7 +662,13 @@ class QwenRegressionTrainer:
             logger.warning(f"Saved model not found for evaluation: {model_path}")
             return False
 
-        state_dict = torch.load(model_path, map_location='cpu')
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        try:
+            state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
+        except TypeError:
+            state_dict = torch.load(model_path, map_location='cpu')
         self._unwrap_model().load_state_dict(state_dict)
         self.model = self.model.to(self.device)
         return True
