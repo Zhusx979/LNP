@@ -1,8 +1,0 @@
-{
-  "run_name": "real_data_head_log2_20260705_182903",
-  "updated_at": "2026-07-05T18:31:32",
-  "run_dir": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\runs\\real_data_head_log2_20260705_182903",
-  "best_checkpoint_dir": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\runs\\real_data_head_log2_20260705_182903\\checkpoints\\best",
-  "final_checkpoint_dir": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\runs\\real_data_head_log2_20260705_182903\\checkpoints\\final",
-  "metadata_path": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\runs\\real_data_head_log2_20260705_182903\\run_metadata.json"
-}

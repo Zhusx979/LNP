@@ -8,3 +8,15 @@ __pycache__/
 *.pyc
 logs/
 outputs/
+*.log
+*.tmp
+*.temp
+tempCodeRunnerFile.py
+.hf_cache/
+Real_data/train/configs/
+Real_data/train/prepared_data/
+Real_data/train/reports/
+Real_data/train/runs/
+Real_data/train/latest_run.json
+data/waiting hub/test/.hf_cache/
+data/waiting hub/test/reports/
