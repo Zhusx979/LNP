@@ -623,3 +623,4 @@ class RegressionDataModule:
         )
         
         return self.train_loader, self.val_loader, self.test_loader
+

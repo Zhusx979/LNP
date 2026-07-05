@@ -1,0 +1,57 @@
+{
+  "run_name": "real_data_head_log2_20260705_182903",
+  "created_at": "2026-07-05T18:29:04",
+  "status": "training_in_progress",
+  "finetune_method": "head",
+  "target_transform": {
+    "method": "log2"
+  },
+  "paths": {
+    "data_path": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\real_data_smiles_target.xlsx",
+    "pretrained_model_path": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\models\\qwen_1.8b_smiles_pretrained\\final_model",
+    "tokenizer_path": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\models\\qwen_1.8b_smiles_pretrained\\tokenizer.json",
+    "run_dir": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\runs\\real_data_head_log2_20260705_182903",
+    "prepared_dir": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\prepared_data\\real_data_head_log2_20260705_182903",
+    "reports_dir": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\runs\\real_data_head_log2_20260705_182903\\reports",
+    "best_checkpoint_dir": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\runs\\real_data_head_log2_20260705_182903\\checkpoints\\best",
+    "final_checkpoint_dir": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\runs\\real_data_head_log2_20260705_182903\\checkpoints\\final",
+    "config_path": "E:\\School Work\\Deep Learning\\Paper\\Huaxi\\virtual_LNP\\Real_data\\train\\configs\\real_data_head_log2_20260705_182903.json"
+  },
+  "split_sizes": {
+    "train": 840,
+    "val": 240,
+    "test": 120
+  },
+  "train_config": {
+    "num_epochs": 1,
+    "batch_size": 1,
+    "learning_rate": 1e-05,
+    "weight_decay": 0.001,
+    "gradient_accumulation_steps": 4,
+    "max_grad_norm": 1.0,
+    "max_length": 256,
+    "seed": 42,
+    "device": "cuda:0",
+    "mixed_precision": "auto",
+    "dropout": 0.1,
+    "train_embeddings": false,
+    "lora_r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.05,
+    "lora_target_modules": [
+      "c_attn",
+      "c_proj",
+      "w1",
+      "w2"
+    ]
+  },
+  "dataset_summary": {
+    "num_rows": 1200,
+    "target_min": 18.0,
+    "target_max": 8925502.0,
+    "target_mean": 1035227.2433333333,
+    "target_std": 1437569.1210997195
+  },
+  "best_epoch": 1,
+  "best_val_rmse": 1743076.0642106852
+}

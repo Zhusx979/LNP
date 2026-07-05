@@ -127,7 +127,7 @@ def test_data_loading():
         return True
     
     except Exception as e:
-        print(f"? FAILED: {e}")
+        print(f"FAILED: {e}")
         import traceback
         traceback.print_exc()
         return False

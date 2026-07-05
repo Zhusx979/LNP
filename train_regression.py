@@ -259,7 +259,7 @@ class QwenRegressionTrainer:
         self.tokenizer.build_vocab(smiles_list)
         expanded_vocab_size = len(self.tokenizer)
         logger.info(
-            f"  Regression vocabulary size: {expanded_vocab_size} "
+            f"Regression vocabulary size: {expanded_vocab_size} "
             f"(added {expanded_vocab_size - original_vocab_size} tokens)"
         )
 
@@ -328,7 +328,7 @@ class QwenRegressionTrainer:
         if self.model_config['full_finetune']:
             for parameter in trainable_model.parameters():
                 parameter.requires_grad = True
-            logger.info("  Full fine-tuning enabled")
+            logger.info("Full fine-tuning enabled")
             return
 
         for parameter in trainable_model.model.parameters():
@@ -343,7 +343,7 @@ class QwenRegressionTrainer:
             parameter.requires_grad = True
 
         logger.info(
-            f"  Backbone frozen: True | Train embeddings: {self.model_config['train_embeddings']}"
+            f"Backbone frozen: True | Train embeddings: {self.model_config['train_embeddings']}"
         )
     
     def train(self):
