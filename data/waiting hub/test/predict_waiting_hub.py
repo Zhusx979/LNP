@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -153,6 +154,51 @@ def resolve_model_dtype(metadata: Dict, device: torch.device) -> Optional[torch.
 def read_json(path: Path) -> Dict:
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def build_inference_progress_stages(batch_count: int) -> Dict[str, Dict[str, int]]:
+    """Describe the visible stages in waiting-hub inference."""
+    return {
+        "load_candidates": {"total": 1},
+        "resolve_run": {"total": 1},
+        "load_checkpoint": {"total": 1},
+        "predict_batches": {"total": batch_count},
+    }
+
+
+def summarize_predictions(predictions: np.ndarray, top_k: int = 10) -> Dict[str, object]:
+    """Summarize a vector of unlabeled predictions."""
+    predictions = np.asarray(predictions, dtype=np.float64)
+    if predictions.size == 0:
+        return {
+            "prediction_count": 0,
+            "prediction_min": float("nan"),
+            "prediction_max": float("nan"),
+            "prediction_mean": float("nan"),
+            "prediction_median": float("nan"),
+            "prediction_std": float("nan"),
+            "prediction_p05": float("nan"),
+            "prediction_p25": float("nan"),
+            "prediction_p75": float("nan"),
+            "prediction_p95": float("nan"),
+            "top_predictions": [],
+        }
+
+    top_k = max(1, min(int(top_k), predictions.size))
+    ranked = np.sort(predictions)[::-1]
+    return {
+        "prediction_count": int(predictions.size),
+        "prediction_min": float(np.min(predictions)),
+        "prediction_max": float(np.max(predictions)),
+        "prediction_mean": float(np.mean(predictions)),
+        "prediction_median": float(np.median(predictions)),
+        "prediction_std": float(np.std(predictions)),
+        "prediction_p05": float(np.percentile(predictions, 5)),
+        "prediction_p25": float(np.percentile(predictions, 25)),
+        "prediction_p75": float(np.percentile(predictions, 75)),
+        "prediction_p95": float(np.percentile(predictions, 95)),
+        "top_predictions": [float(value) for value in ranked[:top_k]],
+    }
 
 
 def resolve_run_directory(run_dir_arg: Optional[str]) -> Path:
@@ -320,16 +366,22 @@ def predict(args: argparse.Namespace) -> Dict:
     if not candidate_path.exists():
         raise FileNotFoundError(f"Candidate Excel file not found: {candidate_path}")
 
+    setup_bar = tqdm(total=4, desc="Waiting hub setup", unit="stage", dynamic_ncols=True)
+    setup_bar.set_postfix_str("load candidates")
     candidate_frame = load_candidate_frame(candidate_path)
+    setup_bar.update(1)
     run_dir: Optional[Path] = None
     checkpoint_dir: Optional[Path] = None
     metadata: Optional[Dict] = None
 
     try:
+        setup_bar.set_postfix_str("resolve run")
         run_dir = resolve_run_directory(args.run_dir)
         checkpoint_dir, metadata = resolve_checkpoint_paths(run_dir, args.checkpoint)
+        setup_bar.update(1)
     except FileNotFoundError as exc:
         if args.preview_only:
+            setup_bar.close()
             return run_preview(
                 candidate_path=candidate_path,
                 run_dir=None,
@@ -341,16 +393,19 @@ def predict(args: argparse.Namespace) -> Dict:
         raise
 
     if args.preview_only:
+        setup_bar.close()
         return run_preview(candidate_path, run_dir, checkpoint_dir, metadata, candidate_frame)
 
     assert run_dir is not None and checkpoint_dir is not None and metadata is not None
     device = resolve_device(args.device)
+    setup_bar.set_postfix_str("load model")
     model, tokenizer = load_regression_model(
         checkpoint_dir=checkpoint_dir,
         metadata=metadata,
         device=device,
         max_length_override=args.max_length,
     )
+    setup_bar.update(1)
 
     dataset = CandidateDataset(candidate_frame, tokenizer)
     loader = DataLoader(
@@ -362,17 +417,32 @@ def predict(args: argparse.Namespace) -> Dict:
     )
 
     transformed_predictions = []
+    inference_bar = tqdm(
+        loader,
+        total=len(loader),
+        desc="Predict batches",
+        unit="batch",
+        dynamic_ncols=True,
+    )
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(inference_bar):
             batch = move_batch_to_device(batch, device)
             predictions = model(**batch).view(-1)
             transformed_predictions.extend(predictions.detach().cpu().tolist())
+            inference_bar.set_postfix(
+                batch=batch_index + 1,
+                count=len(transformed_predictions),
+            )
+    inference_bar.close()
+    setup_bar.update(1)
+    setup_bar.close()
 
     transformed_predictions_np = np.asarray(transformed_predictions, dtype=np.float64)
     original_predictions = inverse_transform_targets(
         transformed_predictions_np,
         metadata["target_transform"],
     )
+    prediction_summary = summarize_predictions(original_predictions, top_k=10)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     inference_name = f"{run_dir.name}_{args.checkpoint}_{timestamp}"
@@ -388,8 +458,18 @@ def predict(args: argparse.Namespace) -> Dict:
             "Prediction": original_predictions,
         }
     )
+    sorted_output_frame = output_frame.sort_values("Prediction", ascending=False).reset_index(drop=True)
     output_frame.to_excel(prediction_dir / "waiting_hub_predictions.xlsx", index=False)
     output_frame.to_csv(prediction_dir / "waiting_hub_predictions.csv", index=False, encoding="utf-8-sig")
+    sorted_output_frame.to_excel(
+        prediction_dir / "waiting_hub_predictions_sorted.xlsx",
+        index=False,
+    )
+    sorted_output_frame.to_csv(
+        prediction_dir / "waiting_hub_predictions_sorted.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     summary = {
         "inference_name": inference_name,
@@ -402,9 +482,8 @@ def predict(args: argparse.Namespace) -> Dict:
         "report_dir": str(report_dir.resolve()),
         "finetune_method": metadata["finetune_method"],
         "target_transform": metadata["target_transform"],
-        "prediction_min": float(output_frame["Prediction"].min()),
-        "prediction_max": float(output_frame["Prediction"].max()),
-        "prediction_mean": float(output_frame["Prediction"].mean()),
+        **prediction_summary,
+        "top_prediction_rows": sorted_output_frame.head(10).to_dict(orient="records"),
     }
     with open(report_dir / "summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)

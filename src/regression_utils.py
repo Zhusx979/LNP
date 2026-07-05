@@ -55,6 +55,7 @@ def compute_regression_metrics(
     """Compute a comprehensive set of regression metrics."""
     if len(y_true) == 0:
         return {
+            "prediction_count": 0,
             "mse": float("nan"),
             "rmse": float("nan"),
             "mae": float("nan"),
@@ -72,6 +73,21 @@ def compute_regression_metrics(
             "mape_nonzero": float("nan"),
             "nrmse_range": float("nan"),
             "nrmse_std": float("nan"),
+            "target_min": float("nan"),
+            "target_max": float("nan"),
+            "target_mean": float("nan"),
+            "target_std": float("nan"),
+            "prediction_min": float("nan"),
+            "prediction_max": float("nan"),
+            "prediction_mean": float("nan"),
+            "prediction_std": float("nan"),
+            "p50_abs_error": float("nan"),
+            "p75_abs_error": float("nan"),
+            "p90_abs_error": float("nan"),
+            "p95_abs_error": float("nan"),
+            "under_prediction_rate": float("nan"),
+            "over_prediction_rate": float("nan"),
+            "exact_match_rate": float("nan"),
         }
 
     errors = y_pred - y_true
@@ -110,6 +126,7 @@ def compute_regression_metrics(
         explained_variance = float("nan")
 
     return {
+        "prediction_count": int(len(y_true)),
         "mse": mse,
         "rmse": rmse,
         "mae": mae,
@@ -127,6 +144,21 @@ def compute_regression_metrics(
         "mape_nonzero": mape_nonzero,
         "nrmse_range": nrmse_range,
         "nrmse_std": nrmse_std,
+        "target_min": float(np.min(y_true)),
+        "target_max": float(np.max(y_true)),
+        "target_mean": float(np.mean(y_true)),
+        "target_std": float(np.std(y_true)),
+        "prediction_min": float(np.min(y_pred)),
+        "prediction_max": float(np.max(y_pred)),
+        "prediction_mean": float(np.mean(y_pred)),
+        "prediction_std": float(np.std(y_pred)),
+        "p50_abs_error": float(np.percentile(abs_errors, 50)),
+        "p75_abs_error": float(np.percentile(abs_errors, 75)),
+        "p90_abs_error": float(np.percentile(abs_errors, 90)),
+        "p95_abs_error": float(np.percentile(abs_errors, 95)),
+        "under_prediction_rate": float(np.mean(errors < 0)),
+        "over_prediction_rate": float(np.mean(errors > 0)),
+        "exact_match_rate": float(np.mean(np.isclose(errors, 0.0))),
     }
 
 

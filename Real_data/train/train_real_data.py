@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -439,6 +440,59 @@ def write_json(path: Path, payload: Dict) -> None:
         json.dump(json_ready_dict(payload), handle, ensure_ascii=False, indent=2)
 
 
+def build_training_progress_stages(num_epochs: int) -> Dict[str, Dict[str, int]]:
+    """Describe the training pipeline stages shown in progress bars."""
+    return {
+        "load_data": {"total": 1},
+        "load_tokenizer": {"total": 1},
+        "load_pretrained_model": {"total": 1},
+        "train_epochs": {"total": num_epochs},
+    }
+
+
+def summarize_split_metrics(
+    epoch: int,
+    train_loss: float,
+    val_metrics: Dict,
+    test_metrics: Dict,
+) -> Dict:
+    """Flatten val/test metrics for per-epoch CSV logging."""
+    summary = {
+        "epoch": epoch,
+        "train_loss_transformed": train_loss,
+    }
+    for prefix, metrics in (("val", val_metrics), ("test", test_metrics)):
+        for key, value in metrics.items():
+            if key == "split":
+                continue
+            summary[f"{prefix}_{key}"] = value
+    return summary
+
+
+def update_progress_stage(progress_bar, steps: int, stage_name: str) -> None:
+    """Advance a tqdm stage bar with a short status message."""
+    if progress_bar is None:
+        return
+    progress_bar.set_postfix_str(stage_name)
+    progress_bar.update(steps)
+
+
+def format_metric_postfix(metrics: Dict[str, float], keys: List[str]) -> Dict[str, str]:
+    """Format a small subset of metrics for tqdm postfix display."""
+    postfix = {}
+    for key in keys:
+        value = metrics.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (int, np.integer)):
+            postfix[key] = str(int(value))
+        elif isinstance(value, (float, np.floating)):
+            postfix[key] = f"{float(value):.4f}"
+        else:
+            postfix[key] = str(value)
+    return postfix
+
+
 def configure_trainable_parameters(model: QwenRegressionModel, method: str, train_embeddings: bool) -> None:
     if method == "lora":
         for parameter in model.head.parameters():
@@ -498,14 +552,27 @@ def evaluate_model(
     amp_dtype: Optional[torch.dtype],
     transform_metadata: Dict[str, float],
     split_name: str,
+    show_progress: bool = False,
+    progress_desc: Optional[str] = None,
 ) -> Tuple[Dict[str, float], pd.DataFrame]:
     model.eval()
     total_loss = 0.0
     transformed_predictions: List[float] = []
     transformed_labels: List[float] = []
 
+    iterator = loader
+    if show_progress:
+        iterator = tqdm(
+            loader,
+            total=len(loader),
+            desc=progress_desc or f"Evaluate {split_name}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        )
+
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(iterator):
             batch = move_batch_to_device(batch, device)
             labels = batch.pop("label").view(-1)
             with autocast_context(device, amp_dtype):
@@ -515,6 +582,19 @@ def evaluate_model(
             total_loss += float(loss.item())
             transformed_predictions.extend(predictions.detach().cpu().tolist())
             transformed_labels.extend(labels.detach().cpu().tolist())
+            if show_progress:
+                iterator.set_postfix(
+                    **format_metric_postfix(
+                        {
+                            "batch": batch_index + 1,
+                            "loss": total_loss / (batch_index + 1),
+                        },
+                        ["batch", "loss"],
+                    )
+                )
+
+    if show_progress:
+        iterator.close()
 
     transformed_predictions_np = np.asarray(transformed_predictions, dtype=np.float64)
     transformed_labels_np = np.asarray(transformed_labels, dtype=np.float64)
@@ -541,6 +621,7 @@ def evaluate_model(
             "prediction_transformed": transformed_predictions_np,
             "error_original": original_predictions - original_labels,
             "abs_error_original": np.abs(original_predictions - original_labels),
+            "squared_error_original": np.square(original_predictions - original_labels),
         }
     )
     return metrics, prediction_frame
@@ -569,6 +650,13 @@ def save_checkpoint(
 
 def run_training(args: argparse.Namespace) -> Dict:
     set_seed(args.seed)
+    progress_stages = build_training_progress_stages(args.num_epochs)
+    pipeline_bar = tqdm(
+        total=sum(stage["total"] for stage in progress_stages.values()),
+        desc="Real-data pipeline",
+        unit="step",
+        dynamic_ncols=True,
+    )
 
     data_path = Path(args.data_path).resolve()
     if not data_path.exists():
@@ -579,6 +667,7 @@ def run_training(args: argparse.Namespace) -> Dict:
     frame = frame.copy()
     frame["target_original"] = frame["target"].astype(float)
     frame["target_transformed"] = transformed_targets
+    update_progress_stage(pipeline_bar, progress_stages["load_data"]["total"], "load data")
 
     run_name = make_run_name(args)
     layout = build_run_layout(run_name)
@@ -656,14 +745,19 @@ def run_training(args: argparse.Namespace) -> Dict:
     if args.prepare_only:
         metadata["status"] = "prepare_only_complete"
         write_json(layout.metadata_path, metadata)
+        pipeline_bar.close()
         return metadata
 
     device = resolve_device(args.device)
     amp_dtype = resolve_amp_dtype(device, args.mixed_precision)
 
+    tokenizer_bar = tqdm(total=1, desc="Load tokenizer", unit="stage", dynamic_ncols=True)
     tokenizer = SMILESTokenizer(max_length=args.max_length)
     tokenizer.load(args.tokenizer_path)
     tokenizer.build_vocab(frame["smiles"].tolist())
+    tokenizer_bar.update(1)
+    tokenizer_bar.close()
+    update_progress_stage(pipeline_bar, progress_stages["load_tokenizer"]["total"], "load tokenizer")
 
     train_dataset = SmilesRegressionDataset(train_df, tokenizer, args.max_length)
     val_dataset = SmilesRegressionDataset(val_df, tokenizer, args.max_length)
@@ -691,7 +785,15 @@ def run_training(args: argparse.Namespace) -> Dict:
         pin_memory=device.type == "cuda",
     )
 
+    model_bar = tqdm(total=1, desc="Load pretrained model", unit="stage", dynamic_ncols=True)
     model = create_regression_model(args, tokenizer, device, amp_dtype)
+    model_bar.update(1)
+    model_bar.close()
+    update_progress_stage(
+        pipeline_bar,
+        progress_stages["load_pretrained_model"]["total"],
+        "load model",
+    )
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable_parameters,
@@ -708,12 +810,27 @@ def run_training(args: argparse.Namespace) -> Dict:
     best_val_predictions: Optional[pd.DataFrame] = None
     best_test_predictions: Optional[pd.DataFrame] = None
 
-    for epoch in range(args.num_epochs):
+    epoch_bar = tqdm(
+        range(args.num_epochs),
+        total=args.num_epochs,
+        desc="Training epochs",
+        unit="epoch",
+        dynamic_ncols=True,
+    )
+    for epoch in epoch_bar:
         model.train()
         running_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
 
-        for batch_index, batch in enumerate(train_loader):
+        train_batch_bar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            desc=f"Epoch {epoch + 1}/{args.num_epochs} train",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        )
+        for batch_index, batch in train_batch_bar:
             batch = move_batch_to_device(batch, device)
             labels = batch.pop("label").view(-1)
             should_step = (
@@ -731,6 +848,15 @@ def run_training(args: argparse.Namespace) -> Dict:
                 loss.backward()
 
             running_loss += float(raw_loss.item())
+            train_batch_bar.set_postfix(
+                **format_metric_postfix(
+                    {
+                        "loss": running_loss / (batch_index + 1),
+                        "step": (batch_index + 1) // max(1, args.gradient_accumulation_steps),
+                    },
+                    ["loss", "step"],
+                )
+            )
 
             if should_step:
                 if scaler.is_enabled():
@@ -742,6 +868,7 @@ def run_training(args: argparse.Namespace) -> Dict:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+        train_batch_bar.close()
 
         train_loss = running_loss / max(1, len(train_loader))
         val_metrics, val_predictions = evaluate_model(
@@ -752,6 +879,8 @@ def run_training(args: argparse.Namespace) -> Dict:
             amp_dtype=amp_dtype,
             transform_metadata=transform_metadata,
             split_name="val",
+            show_progress=True,
+            progress_desc=f"Epoch {epoch + 1}/{args.num_epochs} val",
         )
         test_metrics, test_predictions = evaluate_model(
             model=model,
@@ -761,19 +890,40 @@ def run_training(args: argparse.Namespace) -> Dict:
             amp_dtype=amp_dtype,
             transform_metadata=transform_metadata,
             split_name="test",
+            show_progress=True,
+            progress_desc=f"Epoch {epoch + 1}/{args.num_epochs} test",
         )
 
-        epoch_record = {
-            "epoch": epoch + 1,
-            "train_loss_transformed": train_loss,
-            "val_rmse": val_metrics["rmse"],
-            "val_mae": val_metrics["mae"],
-            "val_r2": val_metrics["r2"],
-            "test_rmse": test_metrics["rmse"],
-            "test_mae": test_metrics["mae"],
-            "test_r2": test_metrics["r2"],
-        }
+        epoch_record = summarize_split_metrics(
+            epoch=epoch + 1,
+            train_loss=train_loss,
+            val_metrics=val_metrics,
+            test_metrics=test_metrics,
+        )
         metrics_history.append(epoch_record)
+        epoch_bar.set_postfix(
+            train_loss=f"{train_loss:.4f}",
+            val_rmse=f"{val_metrics['rmse']:.4f}",
+            test_rmse=f"{test_metrics['rmse']:.4f}",
+        )
+        update_progress_stage(pipeline_bar, 1, f"epoch {epoch + 1}")
+        tqdm.write(
+            " | ".join(
+                [
+                    f"Epoch {epoch + 1}/{args.num_epochs}",
+                    f"train_loss={train_loss:.4f}",
+                    f"val_rmse={val_metrics['rmse']:.4f}",
+                    f"val_mae={val_metrics['mae']:.4f}",
+                    f"val_r2={val_metrics['r2']:.4f}",
+                    f"val_pearson={val_metrics['pearson_r']:.4f}",
+                    f"val_spearman={val_metrics['spearman_r']:.4f}",
+                    f"val_p90_ae={val_metrics['p90_abs_error']:.4f}",
+                    f"test_rmse={test_metrics['rmse']:.4f}",
+                    f"test_mae={test_metrics['mae']:.4f}",
+                    f"test_r2={test_metrics['r2']:.4f}",
+                ]
+            )
+        )
 
         if np.isfinite(val_metrics["rmse"]) and val_metrics["rmse"] < best_val_rmse:
             best_val_rmse = float(val_metrics["rmse"])
@@ -793,6 +943,7 @@ def run_training(args: argparse.Namespace) -> Dict:
                 finetune_method=args.finetune_method,
                 metadata=metadata,
             )
+    epoch_bar.close()
 
     save_checkpoint(
         model=model,
@@ -810,6 +961,8 @@ def run_training(args: argparse.Namespace) -> Dict:
         amp_dtype=amp_dtype,
         transform_metadata=transform_metadata,
         split_name="final_val",
+        show_progress=True,
+        progress_desc="Final val evaluation",
     )
     final_test_metrics, final_test_predictions = evaluate_model(
         model=model,
@@ -819,6 +972,8 @@ def run_training(args: argparse.Namespace) -> Dict:
         amp_dtype=amp_dtype,
         transform_metadata=transform_metadata,
         split_name="final_test",
+        show_progress=True,
+        progress_desc="Final test evaluation",
     )
 
     pd.DataFrame(metrics_history).to_csv(layout.reports_dir / "metrics_history.csv", index=False)
@@ -841,6 +996,7 @@ def run_training(args: argparse.Namespace) -> Dict:
     metadata["best_test_metrics"] = best_test_metrics
     metadata["final_val_metrics"] = final_val_metrics
     metadata["final_test_metrics"] = final_test_metrics
+    metadata["epoch_history_columns"] = list(metrics_history[0].keys()) if metrics_history else []
     write_json(layout.metadata_path, metadata)
     write_json(layout.reports_dir / "summary.json", metadata)
     write_json(
@@ -854,6 +1010,7 @@ def run_training(args: argparse.Namespace) -> Dict:
             "metadata_path": str(layout.metadata_path.resolve()),
         },
     )
+    pipeline_bar.close()
     return metadata
 
 
@@ -870,6 +1027,14 @@ def print_summary(metadata: Dict) -> None:
     print(f"split_sizes       : {metadata['split_sizes']}")
     if "best_val_rmse" in metadata:
         print(f"best_val_rmse     : {metadata['best_val_rmse']}")
+    if metadata.get("best_val_metrics"):
+        print(f"best_val_mae      : {metadata['best_val_metrics'].get('mae')}")
+        print(f"best_val_r2       : {metadata['best_val_metrics'].get('r2')}")
+        print(f"best_val_pearson  : {metadata['best_val_metrics'].get('pearson_r')}")
+    if metadata.get("best_test_metrics"):
+        print(f"best_test_rmse    : {metadata['best_test_metrics'].get('rmse')}")
+        print(f"best_test_mae     : {metadata['best_test_metrics'].get('mae')}")
+        print(f"best_test_r2      : {metadata['best_test_metrics'].get('r2')}")
     print("=" * 72)
 
 
